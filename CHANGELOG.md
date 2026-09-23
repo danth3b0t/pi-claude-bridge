@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: tools activated mid-turn never reached Claude** — an extension that enables tools from inside a tool call (pi-web-access's `web_enable`) changed pi's tool set, but the bridge's MCP server was fixed at query start, so the model kept the old set until the next user message and fell back to `curl`. The bridge now replaces the served tools on the live server, sends `tools/list_changed`, and holds the tool result until Claude Code has re-listed; delivering first races the re-list and loses (`diag/probe-mid-turn-tools.mjs`). Covered by `tests/unit-queue.mjs`, `tests/unit-mcp-server.mjs` and a contract in `tests/int-cc-contracts.mjs`.
+
 ## 0.9.0 — 2026-09-27
 
 - **Bump: require pi ≥0.86.1 and drop pre-0.86 compat** — This breaks support for pi <0.86.1. Use pi-ai's transcript helpers and update dev peers to `^0.87.1` and the Agent SDK to `^0.3.280`; the API now rejects older Claude Code clients.
