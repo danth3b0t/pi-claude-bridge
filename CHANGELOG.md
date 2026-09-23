@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: tools activated mid-turn never reached Claude** — an extension that enables tools from inside a tool call (pi-web-access's `web_enable`) changed pi's tool set, but the bridge's MCP server was fixed at query start, so the model kept the old set until the next user message and fell back to `curl`. The bridge now replaces the served tools on the live server, sends `tools/list_changed`, and holds the tool result until Claude Code has re-listed; delivering first races the re-list and loses (`diag/probe-mid-turn-tools.mjs`). Covered by `tests/unit-queue.mjs`, `tests/unit-mcp-server.mjs` and a contract in `tests/int-cc-contracts.mjs`.
+
 ## 0.9.2 — 2026-10-07
 
 - **Fix: synthetic failure notices no longer stream as assistant output (#162)** — keeps pre-output failover working for consumers like pi-model-fallback-alias; the notice text stays on the failed turn's error event. A notice following a stalled stream also drops the dead stream's abandoned partial blocks.
