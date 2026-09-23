@@ -3,6 +3,7 @@
 ## UNRELEASED
 
 - **Add: pi's prompt-cache warming** — a warm request (a session's last request re-sent with `maxTokens: 1`, as pi's cache warmer and extensions calling `modelRegistry.streamSimple` send it) no longer starts a turn. It resumes a non-persisted fork of the session's Claude Code conversation with the same options as the turn it warms, refuses every tool, and closes at the first request's usage, which it returns as the reply's usage. It is refused, spawning nothing, when the session has no conversation, a query of it is open, or the next turn would rebuild it (another model, system prompt or working directory, or history the conversation did not record). Models now declare `promptCache` (5 minutes, the shorter lifetime Claude Code uses); with the bridge's zero prices pi's own warmer still never sends one. Covered by `tests/unit-cache-warm.mjs`.
+- **Fix: tools activated mid-turn never reached Claude (#125, issue #176)** — a tool that changes pi's active tools from inside a tool call (`tool_search` loading a deferred MCP tool, pi-web-access's `web_enable`) had no effect until the next user message. The bridge now updates its live MCP server, sends `tools/list_changed`, and holds the tool result until Claude Code has re-listed. Thanks @danth3b0t and @Piesson.
 
 ## 0.11.0 — 2026-11-06
 
