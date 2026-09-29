@@ -2,7 +2,7 @@
 
 ## UNRELEASED
 
-- **Add: Claude Sonnet 5.5 via `provider.extraModels`** — pi-ai 0.87.1's catalog does not list `claude-sonnet-5-5` yet, so `provider.extraModels` returns: ids offered ahead of the catalog, each copying the newest catalog model of its family, ignored once pi-ai ships them. Set `"extraModels": ["claude-sonnet-5-5"]`. It serves the bare id at 200K until its `[1m]` behavior is measured. Agent SDK goes to `^0.3.284`, the first whose bundled Claude Code knows the model.
+- **Add: Claude Sonnet 5.5 via `provider.extraModels`** — pi-ai 0.87.1's catalog does not list `claude-sonnet-5-5` yet, so `provider.extraModels` returns: ids offered ahead of the catalog, each copying the newest catalog model of its family, ignored once pi-ai ships them. Set `"extraModels": ["claude-sonnet-5-5"]`. It requests `[1m]` and registers 1M: measured 1M on Max, both bare and `[1m]` (`diag/CONTEXT-SIZE.md`); Pro is unmeasured. Agent SDK goes to `^0.3.284`, the first whose bundled Claude Code knows the model.
 - **Fix: tools activated mid-turn never reached Claude** — an extension that enables tools from inside a tool call (pi-web-access's `web_enable`) changed pi's tool set, but the bridge's MCP server was fixed at query start, so the model kept the old set until the next user message and fell back to `curl`. The bridge now replaces the served tools on the live server, sends `tools/list_changed`, and holds the tool result until Claude Code has re-listed; delivering first races the re-list and loses (`diag/probe-mid-turn-tools.mjs`). Covered by `tests/unit-queue.mjs`, `tests/unit-mcp-server.mjs` and a contract in `tests/int-cc-contracts.mjs`.
 
 ## 0.9.0 — 2026-09-27

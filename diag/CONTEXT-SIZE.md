@@ -51,6 +51,8 @@ the footnote below the table).
 | `claude-opus-4-6[1m]`    | 429              | 1M              | 1M               | 1M              |
 | `claude-fable-5`          | 200K             | —               | —                | —               |
 | `claude-fable-5[1m]`     | 1M               | —               | —                | —               |
+| `claude-sonnet-5-5`       | —                | —               | 1M               | —               |
+| `claude-sonnet-5-5[1m]`  | —                | —               | 1M               | —               |
 | `claude-sonnet-5`         | 200K             | —               | —                | —               |
 | `claude-sonnet-5[1m]`    | 1M               | —               | —                | —               |
 | `claude-sonnet-4-6`       | 200K             | 200K            | 200K             | 200K            |
@@ -59,7 +61,8 @@ the footnote below the table).
 | `claude-haiku-4-5[1m]`   | 429†             | 400             | 400              | 400             |
 
 Raw runs: `.test-output/context-size/{pro,max}-2026-06-26T21-*.json`,
-Opus 5.5 `.test-output/context-size/max-2026-09-23T13-50-08-107Z.json`
+Opus 5.5 `.test-output/context-size/max-2026-09-23T13-50-08-107Z.json`,
+Sonnet 5.5 `.test-output/context-size/max-2026-09-29T10-51-59-249Z.json`
 
 `—` = not yet tested in that condition. Max-credits-on matched Pro-credits-on
 for every cell tested in both (shown for completeness). Opus 5.5 served 1M from
@@ -70,6 +73,10 @@ there. The bridge still requests `[1m]`, which is what keeps its
 unmeasured; its 1M there rests on [Anthropic's documentation](https://code.claude.com/docs/en/model-config#extended-context)
 for Opus 4.7 and later (1M by default on the Anthropic API, including Pro),
 **not an SDK subscription/OAuth measurement**.
+
+Sonnet 5.5 (SDK 0.3.284, Max, credits off, 2026-09-29) matched Opus 5.5: 1M from
+both ids, 128K max output. It is unmeasured on Pro; its `MEASURED_ONE_M` entry
+rests on the Max run plus Sonnet 5's measured 1M `[1m]` on Pro.
 
 † **Inferred, not directly measured.** The Pro-credits-off run predates
 error-field capture; its three rejected `[1m]` rows have no recorded HTTP status

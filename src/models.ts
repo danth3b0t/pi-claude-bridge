@@ -115,6 +115,7 @@ const MEASURED_ONE_M = new Set([
 	"claude-opus-4-8",
 	"claude-opus-4-7",
 	"claude-sonnet-5",
+	"claude-sonnet-5-5",
 ]);
 
 // Measured exceptions: pi-ai declares 1M and the [1m] id works, but only when
