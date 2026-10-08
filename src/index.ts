@@ -885,6 +885,8 @@ export const __test = {
 	finalizeCurrentStream,
 	resultErrorText,
 	deliverToolResults,
+	flushStrandedToolCalls,
+	get STRANDED_CALL_GRACE_MS() { return STRANDED_CALL_GRACE_MS; },
 	drainForAbort,
 	CC_CHILD_ENV,
 	buildMcpServers,
@@ -1083,7 +1085,7 @@ function toMcpToolDefs(tools: Tool[], queryCtx: QueryContext) {
 		name: tool.name,
 		description: tool.description,
 		inputSchema: tool.parameters,
-		handler: async (toolCallId: string) => {
+		handler: async (toolCallId: string, args: unknown) => {
 			if (queryCtx.pendingResults.has(toolCallId)) {
 				const result = queryCtx.pendingResults.get(toolCallId)!;
 				queryCtx.pendingResults.delete(toolCallId);
@@ -1091,9 +1093,14 @@ function toMcpToolDefs(tools: Tool[], queryCtx: QueryContext) {
 				return result;
 			}
 			debug(`mcp handler: ${tool.name} [${toolCallId}] → waiting`);
-			return new Promise<McpResult>((resolve) => {
+			const parked = new Promise<McpResult>((resolve) => {
 				queryCtx.pendingToolCalls.set(toolCallId, { toolName: tool.name, resolve });
 			});
+			if (!queryCtx.deliveredToolCallIds.has(toolCallId)) {
+				const timer = setTimeout(() => rescueStrandedToolCall(queryCtx, toolCallId, tool.name, args), STRANDED_CALL_GRACE_MS);
+				timer.unref?.();
+			}
+			return parked;
 		},
 	}));
 }
@@ -1228,6 +1235,71 @@ function finalizeCurrentStream(c: QueryContext, stopReason?: string): void {
 	c.currentPiStream = null;
 }
 
+/** End pi's turn on toolUse, so pi runs the tool calls in it. The one place a
+ *  call is handed to pi, hence where deliveredToolCallIds is kept. */
+function endPiTurnOnToolUse(c: QueryContext): void {
+	if (!c.currentPiStream || !c.turnOutput) return;
+	for (const block of c.turnBlocks) {
+		if (block.type === "toolCall") c.deliveredToolCallIds.add(block.id);
+	}
+	c.turnOutput.stopReason = "toolUse";
+	const stream = c.currentPiStream;
+	stream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
+	markStreamComplete(stream);
+	stream.end();
+	c.currentPiStream = null;
+}
+
+/** How long a parked MCP handler waits for its call to reach pi by the normal
+ *  route before it is treated as stranded. Claude Code dispatches a call only
+ *  after the message carrying it has completed, so the stream or assistant
+ *  path has normally delivered it before the handler even parks; the grace
+ *  only absorbs the two arriving in the other order. */
+const STRANDED_CALL_GRACE_MS = 1_500;
+
+/** A tool call Claude Code is waiting on that pi was never handed. It happens
+ *  when Claude Code recovers from a stream that died mid-response: it drops what
+ *  had streamed and asks again (a "cut off mid-stream" resume, or a non-streaming
+ *  retry), and the bridge, having already started on the dead response, misses
+ *  the replacement's call — or delivers only part of a parallel batch. Each side
+ *  then waits on the other, and the turn sits on "Working" until aborted.
+ *
+ *  The handler is the one record that can't be wrong about what Claude Code
+ *  waits on, and the tools/call carries the arguments, so deliver from it: on
+ *  pi's open turn if there is one, else on the next pi opens. */
+function rescueStrandedToolCall(c: QueryContext, toolCallId: string, toolName: string, args: unknown): void {
+	if (!c.pendingToolCalls.has(toolCallId) || c.deliveredToolCallIds.has(toolCallId)) return;
+	debug(`WARNING: stranded tool call ${toolName} [${toolCallId}]: Claude Code is waiting on it and pi was never handed it`);
+	c.strandedToolCalls.set(toolCallId, { toolName, args });
+	flushStrandedToolCalls(c);
+}
+
+/** Deliver stranded calls on pi's open turn, if any. A no-op without one: pi's
+ *  turn ended on calls it is now running, and the next streamSimple (their
+ *  results) opens the turn these go out on. */
+function flushStrandedToolCalls(c: QueryContext): void {
+	if (!c.strandedToolCalls.size || !c.currentPiStream || !c.turnOutput) return;
+	// Whatever is still open on this turn belongs to the response Claude Code
+	// abandoned; it would replay as an unsigned block or a half-built call.
+	if (c.turnStreamOpen) dropAbandonedStreamBlocks(c, "stranded tool call delivery");
+	ensureTurnStarted(c);
+	for (const [id, { toolName, args }] of c.strandedToolCalls) {
+		if (!c.pendingToolCalls.has(id) || c.deliveredToolCallIds.has(id)) continue;
+		const block = { type: "toolCall", id, name: toolName, arguments: mapToolArgs(toolName, (args ?? {}) as Record<string, unknown>) };
+		c.turnBlocks.push(block);
+		c.turnToolCallIds.push(id);
+		const idx = c.turnBlocks.length - 1;
+		c.currentPiStream.push({ type: "toolcall_start", contentIndex: idx, partial: c.turnOutput });
+		c.currentPiStream.push({ type: "toolcall_end", contentIndex: idx, toolCall: block as any, partial: c.turnOutput });
+		debug(`provider: delivered stranded tool call ${toolName} [${id}] to pi`);
+	}
+	c.strandedToolCalls.clear();
+	if (c.turnBlocks.some((b: any) => b.type === "toolCall")) {
+		c.turnSawToolCall = true;
+		endPiTurnOnToolUse(c);
+	}
+}
+
 /** Maps Anthropic stream events to pi stream events (text, thinking, toolcall).
  *  On message_stop with tool_use: ends currentPiStream so pi can execute the tool. */
 function processStreamEvent(
@@ -1338,12 +1410,7 @@ function processStreamEvent(
 		// assistant message for this turn, but currentPiStream=null causes
 		// consumeQuery to skip it. The MCP handler blocks the generator until
 		// pi delivers the tool result via the next streamSimple call.
-		c.turnOutput.stopReason = "toolUse";
-		const stream = c.currentPiStream;
-		stream!.push({ type: "done", reason: "toolUse", message: c.turnOutput });
-		markStreamComplete(stream);
-		stream!.end();
-		c.currentPiStream = null;
+		endPiTurnOnToolUse(c);
 
 		// Cursor is updated by the next streamSimple call (tool result delivery path)
 		// which sets cursor = context.messages.length with the post-tool-result context.
@@ -1467,6 +1534,12 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 				debug(`processAssistantMessage: skipping tool_use for unserved tool ${block.name} [${block.id}] — CC rejects it and retries`);
 				continue;
 			}
+			// A retry can repeat a call pi already ran: the dead stream finished it
+			// before stalling, and the fallback carries it again under the same id.
+			if (c.deliveredToolCallIds.has(block.id)) {
+				debug(`processAssistantMessage: skipping tool_use [${block.id}] — already delivered to pi`);
+				continue;
+			}
 			ensureTurnStarted(c);
 			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(block.id);
@@ -1486,14 +1559,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model);
 
 	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
-	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
-		c.turnOutput.stopReason = "toolUse";
-		const stream = c.currentPiStream;
-		stream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
-		markStreamComplete(stream);
-		stream.end();
-		c.currentPiStream = null;
-	}
+	if (c.turnSawToolCall) endPiTurnOnToolUse(c);
 }
 
 /** Background consumer: iterates the SDK generator, pushing events to currentPiStream.
@@ -1844,8 +1910,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// tool result does — see deliverToolResults. Detached so the provider
 		// still returns its stream synchronously.
 		const toolSync = syncServedTools(resultCtx, context);
-		if (toolSync) void toolSync.then(() => deliverToolResults(resultCtx, allResults, steer, context.messages.length));
-		else void deliverToolResults(resultCtx, allResults, steer, context.messages.length);
+		const delivery = toolSync
+			? toolSync.then(() => deliverToolResults(resultCtx, allResults, steer, context.messages.length))
+			: deliverToolResults(resultCtx, allResults, steer, context.messages.length);
+		// A call Claude Code is still waiting on that pi never got goes out on
+		// this turn. Ending it early cuts nothing off: Claude Code cannot start
+		// its next response while any call of the batch is unanswered.
+		void delivery.then(() => flushStrandedToolCalls(resultCtx));
 		// The shared cursor tracks the top-level conversation. A reentrant subagent
 		// delivering its own results would drag it to that subagent's message count
 		// — observed pulling a parent from 5 back to 3, which cost the parent's next

@@ -27,6 +27,13 @@ export class QueryContext {
 	 *  to the owning query when several queries are in flight — pairing a result
 	 *  to its call is done by id from Claude's tools/call _meta, not from here. */
 	turnToolCallIds: string[] = [];
+	/** tool_use ids pi has been handed: in a turn that ended on toolUse, so pi
+	 *  runs them. Query-scoped. An MCP handler parked on an id outside this set is
+	 *  a call Claude Code dispatched that pi will never run on its own. */
+	deliveredToolCallIds = new Set<string>();
+	/** Such calls, waiting for a pi turn to deliver them on. Their arguments
+	 *  come from the tools/call request, not from any stream. */
+	strandedToolCalls = new Map<string, { toolName: string; args: unknown }>();
 	/** Streaming-input handle for the active query — how steers reach CC mid-turn. */
 	promptStream: PromptStream | null = null;
 	/** The query's MCP tool server and the pi tool names it serves. A pi tool set that
@@ -87,6 +94,7 @@ export class QueryContext {
 		for (const pending of this.pendingToolCalls.values()) pending.resolve({ content: [{ type: "text", text: reason }] });
 		this.pendingToolCalls.clear();
 		this.pendingResults.clear();
+		this.strandedToolCalls.clear();
 	}
 
 	resetTurnState(model: Model<any>): void {

@@ -2,10 +2,9 @@
 
 ## UNRELEASED
 
+- **Fix: turns hanging after Claude Code recovers from a dead stream** — when a response stream dies mid-message (a laptop suspended mid-turn, a network change), Claude Code drops what streamed and asks again. The bridge could miss the replacement's tool call, or deliver only the first of a parallel batch, leaving Claude Code waiting in an MCP handler and pi on "Working" until aborted. A handler still waiting on a call pi was never handed after a short grace now delivers it to pi itself, with the arguments from the tools/call, on pi's open turn or the next one; a non-streaming retry no longer re-delivers a call pi already ran. Covered by `tests/unit-stranded-tool-call.mjs`.
 - **Fix: tools activated mid-turn never reached Claude** — an extension that enables tools from inside a tool call (pi-web-access's `web_enable`) changed pi's tool set, but the bridge's MCP server was fixed at query start, so the model kept the old set until the next user message and fell back to `curl`. The bridge now replaces the served tools on the live server, sends `tools/list_changed`, and holds the tool result until Claude Code has re-listed; delivering first races the re-list and loses (`diag/probe-mid-turn-tools.mjs`). Covered by `tests/unit-queue.mjs`, `tests/unit-mcp-server.mjs` and a contract in `tests/int-cc-contracts.mjs`.
-
 - **Fix: deadlock when a stream is cut right after a tool call starts** — The bridge dispatched the call to pi with `{}` arguments at `content_block_start`, under an id Claude Code then dropped when it re-issued the call, so each side waited on the other. Tool calls now dispatch only once their block closes; unclosed blocks are dropped at `message_stop`. Covered by `tests/unit-unfinished-tool-call.mjs`.
-- **Bump: Claude Sonnet 5.5** — Should appear in `/model` with 1M context once pi-ai ships the new catalog entry. Agent SDK bumped to ^0.3.284 (Claude Code 2.1.284).
 
 ## 0.9.2 — 2026-10-07
 
