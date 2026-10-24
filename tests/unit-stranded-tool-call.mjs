@@ -65,7 +65,7 @@ function fakeStream() {
 
 async function startQuery() {
 	const c = new QueryContext();
-	const callTool = await connectClient(Object.values(__test.buildMcpServers(TOOLS, c))[0]);
+	const callTool = await connectClient(Object.values(await __test.buildMcpServers(TOOLS, c))[0]);
 	return { c, callTool };
 }
 

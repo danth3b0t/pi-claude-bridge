@@ -1,7 +1,7 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { query, EffortLevel, SDKMessage, SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
@@ -24,7 +24,7 @@ import {
 	type PromptCapture,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
-import { createToolServer, type ToolServer } from "./mcp-server.js";
+import type { createToolServer, ToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
@@ -592,7 +592,14 @@ async function runIsolatedSummary(
 		const effort = effortForReasoning(model, options?.reasoning);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText.length}`);
 
-		sdkQuery = queryImpl({
+		const runQuery = queryImpl ?? await loadSdkQuery();
+		// Loading can outlive the request. Do not spawn a subprocess for it.
+		if (options?.signal?.aborted) {
+			stream.push({ type: "error", reason: "aborted", error: newAssistantOutput(model, "", "aborted", "Operation aborted") });
+			stream.end();
+			return;
+		}
+		sdkQuery = runQuery({
 			prompt: promptText,
 			options: {
 				cwd,
@@ -858,13 +865,24 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	return { sessionId: session.sessionId };
 }
 
-// The SDK's query(), or a test double (see setQuery).
-let queryImpl: typeof query = query;
+// Cache successful loads, not rejected promises. Concurrent cold callers share
+// module evaluation through import(), but still start independent queries.
+let sdkQueryImpl: typeof query | undefined;
+let toolServerImpl: typeof createToolServer | undefined;
+async function loadSdkQuery(): Promise<typeof query> {
+	return sdkQueryImpl ??= (await import("@anthropic-ai/claude-agent-sdk")).query;
+}
+async function loadToolServer(): Promise<typeof createToolServer> {
+	return toolServerImpl ??= (await import("./mcp-server.js")).createToolServer;
+}
+
+// Test override for provider/summary queries; AskClaude always uses the real SDK.
+let queryImpl: typeof query | undefined;
 
 // @internal
 export const __test = {
 	setQuery(fn: typeof query | null) {
-		queryImpl = fn ?? query;
+		queryImpl = fn ?? undefined;
 	},
 	resetSharedSession(piSessionId?: string | null) {
 		// No id: full reset (the pre-map semantics — tests start from a blank slate).
@@ -904,7 +922,10 @@ export const __test = {
 	get STRANDED_CALL_GRACE_MS() { return STRANDED_CALL_GRACE_MS; },
 	drainForAbort,
 	CC_CHILD_ENV,
-	buildMcpServers,
+	async buildMcpServers(tools: Tool[], queryCtx: QueryContext) {
+		if (tools.length) await loadToolServer();
+		return buildMcpServers(tools, queryCtx);
+	},
 	syncServedTools,
 	get promptCaptures() {
 		return promptCaptures;
@@ -1102,7 +1123,7 @@ function toMcpToolDefs(tools: Tool[], queryCtx: QueryContext) {
 
 function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ToolServer> | undefined {
 	if (!tools.length) return undefined;
-	return { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, toMcpToolDefs(tools, queryCtx)) };
+	return { [MCP_SERVER_NAME]: toolServerImpl!(MCP_SERVER_NAME, toMcpToolDefs(tools, queryCtx)) };
 }
 
 // A pi extension can change the active tool set from inside a tool call
@@ -1997,6 +2018,29 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		return stream;
 	}
 
+	// Do not import either runtime at extension activation. In particular, importing
+	// mcp-server here indirectly loads the MCP SDK and its schema/validation graph.
+	// Wait before claiming a QueryContext: concurrent cold calls must not reset the
+	// same context while imports are pending. The ready path below stays synchronous.
+	const needsToolServer = Boolean(context.tools?.length);
+	if (!(queryImpl ?? sdkQueryImpl) || (needsToolServer && !toolServerImpl)) {
+		void Promise.all([
+			queryImpl ? undefined : loadSdkQuery(),
+			needsToolServer ? loadToolServer() : undefined,
+		]).then(async () => {
+			options?.signal?.throwIfAborted();
+			for await (const event of streamClaudeAgentSdk(model, context, options)) stream.push(event);
+		}).catch((error) => {
+			const reason = options?.signal?.aborted ? "aborted" : "error";
+			const output = newAssistantOutput(model, "", reason, reason === "aborted" ? "Operation aborted" : errorMessage(error));
+			stream.push({ type: "error", reason, error: output });
+		}).finally(() => {
+			markStreamComplete(stream);
+			stream.end();
+		});
+		return stream;
+	}
+
 	// --- Fresh query ---
 
 	// 1. Determine reentrancy. Reentrant queries get their own QueryContext so
@@ -2198,7 +2242,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
-	const sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
+	const sdkQuery = (queryImpl ?? sdkQueryImpl)!({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
 
@@ -2452,6 +2496,8 @@ async function promptAndWait(
 	// removes the Skill tool and the listing with it — but AskClaude runs on CC's native
 	// tools, so it has to be asked for. Pi-side skills still arrive via skillsBlock below,
 	// which is meant to be the only channel.
+	const query = await loadSdkQuery();
+	if (signal?.aborted) throw new Error("Aborted");
 	const sdkQuery = query({
 		prompt,
 		options: {

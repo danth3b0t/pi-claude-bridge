@@ -66,7 +66,7 @@ const TOOLS = ["alpha", "beta", "gamma"].map((name) => ({
 async function startQuery(turnToolCallIds) {
 	const c = new QueryContext();
 	c.turnToolCallIds = [...turnToolCallIds];
-	const servers = __test.buildMcpServers(TOOLS, c);
+	const servers = await __test.buildMcpServers(TOOLS, c);
 	return { c, callTool: await connectClient(Object.values(servers)[0]) };
 }
 
@@ -288,7 +288,7 @@ describe("tool set changed by a tool call", () => {
 	async function startServedQuery(names) {
 		const c = new QueryContext();
 		const tools = TOOLS.filter((t) => names.includes(t.name));
-		const servers = __test.buildMcpServers(tools, c);
+		const servers = await __test.buildMcpServers(tools, c);
 		c.toolServer = Object.values(servers)[0];
 		c.servedToolNames = tools.map((t) => t.name);
 		c.toolNameToPi = new Map(tools.map((t) => [`mcp__custom-tools__${t.name}`, t.name]));
