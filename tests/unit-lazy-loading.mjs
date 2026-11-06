@@ -57,7 +57,6 @@ if (!scenario) {
 		on(name, handler) { const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list); },
 		registerProvider(_name, config) { provider = config; },
 		registerTool(tool) { askClaude = tool; },
-		registerCommand() {},
 	});
 	assert.ok(provider?.models.length, "registration must not wait for the runtime");
 	assert.ok(askClaude?.parameters, "AskClaude schema remains available");

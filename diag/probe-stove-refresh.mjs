@@ -29,7 +29,7 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync } from 
 import { dirname, join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { getSessionPath } from "cc-session-io";
-import { runRefresh } from "../src/stove.ts";
+import { runRefresh } from "../src/cache-stove-adapter.ts";
 import { createToolServer } from "../src/mcp-server.ts";
 import { MCP_SERVER_NAME } from "../src/skills.ts";
 

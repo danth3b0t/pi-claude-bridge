@@ -31,7 +31,7 @@ import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
-import { Stove, runRefresh, type RefreshRecipe } from "./stove.js";
+import { CACHE_STOVE, estimateCache, runRefresh, type CacheEstimate, type KnownCache, type RefreshRecipe } from "./cache-stove-adapter.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -264,20 +264,40 @@ function setSessionStateFor(piSessionId: string | null | undefined, state: Sessi
 	if (state === null || state.needsRebuild) invalidateCache(piSessionId, state === null ? "session mirror dropped" : "session mirror needs a rebuild");
 }
 
-/** The stove of each interactive pi session (src/stove.ts), with the recipe of
- *  its latest real query, which a refresh repeats, and the pi context and active
- *  tool set it last saw. Keyed by real pi session id; non-interactive sessions,
- *  subagents included, never get one. */
-interface StoveSession {
-	stove: Stove;
+/** What the cache-stove adapter (src/cache-stove-adapter.ts) keeps per pi
+ *  session: the recipe of its latest real query, which a refresh repeats, what is
+ *  known about its cached prefix, and an epoch every change of either bumps —
+ *  the opaque identity a refresh must still match. Keyed by real pi session id. */
+interface CacheSession {
+	epoch: number;
+	/** The recipe, and the pi model the query that recorded it served. */
 	recipe?: RefreshRecipe;
-	ctx?: ExtensionContext;
-	activeTools?: string;
+	model?: Model<any>;
+	known?: KnownCache | null;
 }
-const stoveSessions = new Map<string, StoveSession>();
+const cacheSessions = new Map<string, CacheSession>();
+/** pi's event bus, where the stove listens. Null until the extension activates. */
+let cacheBus: ExtensionAPI["events"] | null = null;
+
+function cacheSession(piSessionId: string): CacheSession {
+	let session = cacheSessions.get(piSessionId);
+	if (!session) cacheSessions.set(piSessionId, session = { epoch: 0 });
+	return session;
+}
 
 function invalidateCache(piSessionId: string | null | undefined, reason: string): void {
-	if (piSessionId) stoveSessions.get(piSessionId)?.stove.invalidate(reason);
+	if (!piSessionId) return;
+	const session = cacheSession(piSessionId);
+	session.known = null;
+	session.epoch++;
+	cacheBus?.emit(CACHE_STOVE.invalidate, { version: CACHE_STOVE.version, adapter: CACHE_STOVE.adapter, sessionId: piSessionId, reason });
+}
+
+function cacheEvidence(piSessionId: string, model: Model<any>, anchor: number, estimate: CacheEstimate) {
+	return {
+		version: CACHE_STOVE.version, adapter: CACHE_STOVE.adapter, sessionId: piSessionId,
+		provider: PROVIDER_ID, model: model.id, identity: String(cacheSession(piSessionId).epoch), anchor, ...estimate,
+	};
 }
 
 // pi replaced one of its sessions' history (compact, tree) rather than appending
@@ -951,7 +971,7 @@ export const __test = {
 	get promptCaptures() {
 		return promptCaptures;
 	},
-	stoveSessions,
+	cacheSessions,
 	refreshForSession,
 };
 
@@ -1170,8 +1190,11 @@ function syncServedTools(c: QueryContext, context: Context): Promise<void> | und
 	c.servedToolNames = names;
 	// Tool declarations precede the conversation in the prompt: a refresh with the
 	// old set would miss the cache this query's next request writes.
-	const stoveSession = c.piSessionId ? stoveSessions.get(c.piSessionId) : undefined;
-	if (stoveSession?.recipe) stoveSession.recipe = { ...stoveSession.recipe, tools: mcpTools.map(toolDeclaration) };
+	const cached = c.piSessionId ? cacheSessions.get(c.piSessionId) : undefined;
+	if (cached?.recipe) {
+		cached.recipe = { ...cached.recipe, tools: mcpTools.map(toolDeclaration) };
+		cached.epoch++;
+	}
 	// In place: consumeQuery holds this map. Dropping removed names matters as much
 	// as adding new ones — a call under a name we no longer serve must not reach pi.
 	c.toolNameToPi.clear();
@@ -1384,7 +1407,7 @@ function processStreamEvent(
 		c.turnStreamOpen = true;
 		c.turnStreamBlockStart = c.turnBlocks.length;
 		if (event.message?.usage) recordUsage(c.turnOutput, event.message.usage, model);
-		if (event.message?.usage && (message as { parent_tool_use_id?: string | null }).parent_tool_use_id == null) reportCacheUsage(c, event.message.usage);
+		if (event.message?.usage && (message as { parent_tool_use_id?: string | null }).parent_tool_use_id == null) reportCacheUsage(c, event.message.usage, model);
 		return;
 	}
 
@@ -1486,7 +1509,7 @@ function processStreamEvent(
 	}
 }
 
-/** Hand a main-thread request's cache usage to its session's stove.
+/** Report a main-thread request's cache usage to the stove as evidence.
  *
  *  A cache entry lives from when its request was sent, which is earlier than
  *  this message_start arrives. The anchor is the latest moment the request is
@@ -1495,10 +1518,15 @@ function processStreamEvent(
  *  (a retry, a restream). Input delivered while a request is in flight would
  *  break that, and the bridge delivers input only at the prompt and at tool
  *  boundaries, where Claude Code's main thread is waiting rather than sending. */
-function reportCacheUsage(c: QueryContext, usage: SdkUsage): void {
+function reportCacheUsage(c: QueryContext, usage: SdkUsage, model: Model<any>): void {
 	const anchor = Math.max(c.inputDeliveredAt, c.lastMessageStartAt);
 	c.lastMessageStartAt = Date.now();
-	if (c.reportsCache && c.piSessionId) stoveSessions.get(c.piSessionId)?.stove.recordUsage(usage, anchor);
+	if (!c.reportsCache || !c.piSessionId) return;
+	const session = cacheSession(c.piSessionId);
+	if (session.known && anchor < session.known.anchor) return;
+	const { known, estimate } = estimateCache(usage, session.known ?? null, anchor);
+	session.known = known;
+	cacheBus?.emit(CACHE_STOVE.evidence, cacheEvidence(c.piSessionId, model, anchor, estimate));
 }
 
 /** Remove the blocks of the message that just stopped which never got their own
@@ -2291,10 +2319,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// A query on a shorter, preserved context is not the session's conversation:
 	// its cache usage and options describe a different prefix.
 	queryCtx.reportsCache = !syncResult.preserveSharedSession;
-	const stoveSession = piSessionId ? stoveSessions.get(piSessionId) : undefined;
-	if (stoveSession && queryCtx.reportsCache) {
+	if (piSessionId && queryCtx.reportsCache) {
 		const { resume: _resume, mcpServers: _mcpServers, debug: _debug, debugFile: _debugFile, stderr: _stderr, ...recipeOptions } = queryOptions;
-		stoveSession.recipe = { options: recipeOptions, tools: mcpTools.map(toolDeclaration) };
+		const cached = cacheSession(piSessionId);
+		cached.recipe = { options: recipeOptions, tools: mcpTools.map(toolDeclaration) };
+		cached.model = model;
+		cached.epoch++;
 	}
 
 	// 3. Start SDK query and claim it for this context
@@ -2466,17 +2496,28 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	return stream;
 }
 
-// --- Stove refresh ---
+// --- Cache-stove refresh ---
 
-/** One stove refresh for a pi session: its latest real query, repeated on a
- *  fork of the conversation that query left behind (runRefresh). */
-async function refreshForSession(piSessionId: string, signal: AbortSignal, deadline: number): Promise<SdkUsage> {
-	const recipe = stoveSessions.get(piSessionId)?.recipe;
-	const state = sessionStateFor(piSessionId);
-	if (!recipe || !state || state.needsRebuild) throw new Error("no current Claude Code conversation to refresh");
+/** One cache-stove refresh for a pi session: its latest real query, repeated on
+ *  a fork of the conversation that query left behind (runRefresh). Refuses when
+ *  anything the request depends on changed since the evidence it was asked for. */
+async function refreshForSession(request: { sessionId: string; identity: string; signal: AbortSignal; deadline: number }): Promise<ReturnType<typeof cacheEvidence>> {
+	const { sessionId, identity, signal, deadline } = request;
+	const verify = () => {
+		const cached = cacheSessions.get(sessionId);
+		const state = sessionStateFor(sessionId);
+		if (!cached?.recipe || !cached.model || !state || state.needsRebuild) throw new Error("no current Claude Code conversation to refresh");
+		if (String(cached.epoch) !== identity) throw new Error("the conversation changed since the last request");
+		if ([...activeQueryContexts].some((c) => c.piSessionId === sessionId)) throw new Error("a Claude Code query is still open");
+		return { cached, recipe: cached.recipe, model: cached.model, state };
+	};
+	verify();
 	const query = queryImpl ?? await loadSdkQuery();
 	const createToolServer = await loadToolServer();
-	debug(`stove: refreshing session ${state.sessionId.slice(0, 8)} for pi session ${piSessionId}`);
+	// Loading may have taken long enough for a real query to start.
+	const { cached, recipe, model, state } = verify();
+	debug(`stove: refreshing session ${state.sessionId.slice(0, 8)} for pi session ${sessionId}`);
+	const launchedAt = Date.now();
 	const usage = await runRefresh({
 		query,
 		createToolServer,
@@ -2486,17 +2527,12 @@ async function refreshForSession(piSessionId: string, signal: AbortSignal, deadl
 		deadline,
 	});
 	debug(`stove: refresh usage in=${usage.input_tokens} cacheRead=${usage.cache_read_input_tokens} cacheWrite=${usage.cache_creation_input_tokens} breakdown=${JSON.stringify(usage.cache_creation ?? null)}`);
-	return usage;
-}
-
-/** Why a refresh must not run for this session now, or undefined when it may. */
-function stoveBlocker(piSessionId: string, session: StoveSession, activeTools: string): string | undefined {
-	if (session.ctx && !session.ctx.isIdle()) return "pi is busy";
-	if ([...activeQueryContexts].some((c) => c.piSessionId === piSessionId)) return "a Claude Code query is still open";
-	const state = sessionStateFor(piSessionId);
-	if (!state || state.needsRebuild) return "the conversation must be rebuilt by a real request first";
-	if (session.activeTools !== undefined && session.activeTools !== activeTools) return "the active tools changed since the last request";
-	return undefined;
+	// Anything that changed the conversation meanwhile makes this usage describe a prefix that is gone.
+	signal.throwIfAborted();
+	if (cacheSessions.get(sessionId) !== cached || String(cached.epoch) !== identity) throw new Error("the conversation changed during the refresh");
+	const { known, estimate } = estimateCache(usage, cached.known ?? null, launchedAt, true);
+	if (!cached.known || launchedAt >= cached.known.anchor) cached.known = known;
+	return cacheEvidence(sessionId, model, launchedAt, estimate);
 }
 
 // --- AskClaude: prompt and wait ---
@@ -2739,6 +2775,7 @@ export default function (pi: ExtensionAPI) {
 		// top-level transition takes every mirror with it.
 		sharedSessions.clear();
 		historyRewrittenBySession.clear();
+		cacheSessions.clear();
 
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
@@ -2756,82 +2793,23 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
 		}
-		startStove(ctx);
+		announceCacheAdapter();
 	});
 
-	// --- Stove (src/stove.ts) ---
+	// --- Cache-stove adapter (src/cache-stove-adapter.ts) ---
 	//
-	// Interactive sessions only: a print/json run, an RPC host or a subagent must
-	// not start warming because a session it loads once had the stove on. The
-	// intent is persisted as a custom entry; warmth never is, so a restored session
-	// starts cold and paused until a real request confirms the cache.
-	const STOVE_ENTRY = "claude-bridge-stove";
-	const activeToolsKey = () => [...pi.getActiveTools()].sort().join(",");
-	function stopStove(piSessionId: string): void {
-		stoveSessions.get(piSessionId)?.stove.dispose();
-		stoveSessions.delete(piSessionId);
+	// The stove extension owns /stove, the footer and the timing; this side reports
+	// evidence and sends refreshes. Only the instance serving the provider stream
+	// has the sessions to refresh, so only it registers.
+	cacheBus = pi.events;
+	const cacheAdapter = { version: CACHE_STOVE.version, id: CACHE_STOVE.adapter, provider: PROVIDER_ID, refresh: refreshForSession };
+	function announceCacheAdapter(): void {
+		if ((globalThis as Record<symbol, unknown>)[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) pi.events?.emit(CACHE_STOVE.register, cacheAdapter);
 	}
-	function startStove(ctx: ExtensionContext): void {
-		const piSessionId = ctx.sessionManager.getSessionId();
-		stopStove(piSessionId);
-		if (ctx.mode !== "tui") return;
-		const session: StoveSession = {
-			ctx,
-			stove: new Stove({
-				now: Date.now,
-				setTimer: (fn, ms) => setTimeout(fn, ms).unref(),
-				clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-				render: (view) => {
-					ctx.ui.setStatus("claude-bridge-cache", view ? `cache ${view.cache === "hot" ? "🔥" : "❄️"}` : undefined);
-					ctx.ui.setStatus("claude-bridge-stove", view && view.stove !== "off" ? `stove ${view.stove === "on" ? "●" : "⏸"}` : undefined);
-				},
-				blocker: () => stoveBlocker(piSessionId, session, activeToolsKey()),
-				refresh: (signal, deadline) => refreshForSession(piSessionId, signal, deadline),
-			}),
-		};
-		stoveSessions.set(piSessionId, session);
-		const saved = ctx.sessionManager.getBranch()
-			.filter((entry) => entry.type === "custom" && entry.customType === STOVE_ENTRY)
-			.at(-1) as { data?: { enabled?: boolean } } | undefined;
-		if (saved?.data?.enabled) session.stove.setEnabled(true);
-		session.stove.setSupported(ctx.model?.provider === PROVIDER_ID);
-	}
-	pi.registerCommand("stove", {
-		description: "Keep this session's Claude prompt cache warm while idle: /stove [on|off|status]",
-		getArgumentCompletions: (prefix) => {
-			const items = ["on", "off", "status"].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
-			return items.length ? items : null;
-		},
-		handler: async (args, ctx) => {
-			const session = stoveSessions.get(ctx.sessionManager.getSessionId());
-			if (!session) {
-				ctx.ui.notify("The stove runs only in interactive sessions.", "warning");
-				return;
-			}
-			const arg = args.trim().toLowerCase();
-			const on = arg === "" ? !session.stove.enabled : arg === "on" ? true : arg === "off" ? false : undefined;
-			if (arg !== "status" && on === undefined) {
-				ctx.ui.notify("Usage: /stove [on|off|status]", "warning");
-				return;
-			}
-			if (on !== undefined && on !== session.stove.enabled) {
-				session.stove.setEnabled(on);
-				pi.appendEntry(STOVE_ENTRY, { enabled: on });
-			}
-			if (arg === "status") ctx.ui.notify(session.stove.describe(), "info");
-		},
+	pi.events?.on(CACHE_STOVE.discover, (data) => {
+		if ((data as { version?: unknown } | null)?.version === CACHE_STOVE.version) announceCacheAdapter();
 	});
-	pi.on("agent_settled", (_event, ctx) => {
-		const session = stoveSessions.get(ctx.sessionManager.getSessionId());
-		if (!session) return;
-		session.activeTools = activeToolsKey();
-		session.stove.setBusy(false);
-	});
-	pi.on("model_select", (event, ctx) => {
-		const session = stoveSessions.get(ctx.sessionManager.getSessionId());
-		session?.stove.invalidate("the model changed");
-		session?.stove.setSupported(event.model.provider === PROVIDER_ID);
-	});
+	pi.on("model_select", (_event, ctx) => invalidateCache(ctx.sessionManager.getSessionId(), "the model changed"));
 	pi.on("thinking_level_select", (_event, ctx) => invalidateCache(ctx.sessionManager.getSessionId(), "the thinking level changed"));
 	pi.on("session_before_compact", (event, ctx) => {
 		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
@@ -2884,7 +2862,6 @@ export default function (pi: ExtensionAPI) {
 	// buildSystemPrompt renders verbatim.
 	pi.on("agent_start", (_event, ctx) => {
 		recordSystemPrompt("agent_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
-		stoveSessions.get(ctx.sessionManager.getSessionId())?.stove.setBusy(true);
 	});
 
 	// Mid-run re-renders: turn_start fires before every turn (first turn included)
@@ -2898,7 +2875,6 @@ export default function (pi: ExtensionAPI) {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
-		stopStove(ctx.sessionManager.getSessionId());
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");

@@ -1,18 +1,21 @@
 /**
- * The stove's wiring into the provider (src/index.ts) and its refresh transport.
+ * The cache-stove adapter's wiring into the provider (src/index.ts) and its
+ * refresh transport, seen from pi.events the way the cache-stove extension sees it.
  *
  * Drives real provider turns with a mocked SDK query() (see setQuery), so what is
- * pinned is the bridge's side of the contract: which request each cache report is
- * anchored to, which session events invalidate, and that a refresh replays the
- * real query's recipe with only the isolation overrides added. Whether Claude Code
- * honours that recipe byte-for-byte is a live question this file cannot answer.
+ * pinned is the bridge's side of the contract: which request each evidence report
+ * is anchored to, which session events invalidate, discovery, and that a refresh
+ * replays the real query's recipe with only the isolation overrides added. Whether
+ * Claude Code honours that recipe byte-for-byte is a live question this file
+ * cannot answer.
  */
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runRefresh } from "../src/stove.js";
+import { EventEmitter } from "node:events";
+import { runRefresh } from "../src/cache-stove-adapter.js";
 
 const claudeDir = mkdtempSync(join(tmpdir(), "claude-bridge-stove-cc-"));
 process.env.CLAUDE_CONFIG_DIR = claudeDir;
@@ -22,16 +25,15 @@ const mod = await import("../src/index.js");
 const { __test } = mod;
 
 let providerConfig;
-const commands = new Map();
 const handlers = new Map();
-const entries = [];
+const bus = new EventEmitter();
+const seen = { evidence: [], invalidate: [], register: [] };
+for (const kind of Object.keys(seen)) bus.on(`cache-stove:v1:${kind}`, (data) => seen[kind].push(data));
 mod.default({
 	on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 	registerProvider: (_name, config) => { providerConfig = config; },
 	registerTool: () => {},
-	registerCommand: (name, options) => commands.set(name, options),
-	appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
-	getActiveTools: () => ["read"],
+	events: { emit: (name, data) => bus.emit(name, data), on: (name, fn) => { bus.on(name, fn); return () => bus.off(name, fn); } },
 });
 const emit = async (event, ...args) => { for (const h of handlers.get(event) ?? []) await h(...args); };
 const streamSimple = providerConfig.streamSimple;
@@ -87,22 +89,21 @@ function fakeQuery(steps) {
 	};
 }
 
-/** A stand-in stove for one pi session: records what the bridge reports to it. */
-function fakeStove() {
-	const calls = [];
-	return {
-		calls,
-		recordUsage: (u, anchor) => calls.push({ kind: "usage", read: u.cache_read_input_tokens, anchor }),
-		invalidate: (reason) => calls.push({ kind: "invalidate", reason }),
-		setBusy() {}, setSupported() {}, setEnabled() {}, dispose() {}, describe: () => "",
-		get enabled() { return false; },
-	};
+/** The adapter as the stove receives it: on discovery. */
+function adapter() {
+	seen.register.length = 0;
+	bus.emit("cache-stove:v1:discover", { version: 1 });
+	assert.equal(seen.register.length, 1);
+	return seen.register[0];
 }
+const lastIdentity = (sid) => seen.evidence.filter((e) => e.sessionId === sid).at(-1).identity;
+const refreshReq = (sid, extra = {}) => ({ sessionId: sid, identity: lastIdentity(sid), signal: new AbortController().signal, deadline: Date.now() + 60_000, ...extra });
 
 beforeEach(() => {
 	__test.resetSharedSession();
-	__test.stoveSessions.clear();
+	__test.cacheSessions.clear();
 	queries.length = 0;
+	for (const list of Object.values(seen)) list.length = 0;
 });
 afterEach(() => {
 	__test.setQuery(null);
@@ -112,8 +113,6 @@ afterEach(() => {
 describe("cache evidence from real requests", () => {
 	it("anchors each main-thread message_start at the input that started its request, not at receipt", async () => {
 		mock.timers.enable({ apis: ["Date"], now: 1_000 });
-		const stove = fakeStove();
-		__test.stoveSessions.set("s1", { stove });
 		const g = gate();
 		__test.setQuery(fakeQuery([
 			init("cc-1"),
@@ -132,49 +131,73 @@ describe("cache evidence from real requests", () => {
 		const second = streamSimple(model, { messages: [u1, a1, r1], tools: [readTool] }, { sessionId: "s1" });
 		g.open();
 		await second.result();
-		assert.deepEqual(stove.calls.filter((c) => c.kind === "usage"), [
-			{ kind: "usage", read: 0, anchor: 1_000 },
-			{ kind: "usage", read: 9_000, anchor: 20_000 },
-			{ kind: "usage", read: 9_100, anchor: 25_000 },
+		assert.deepEqual(seen.evidence.map((e) => [e.anchor, e.expiresAt, e.maintain]), [
+			[1_000, 1_000 + 3_600_000, true],
+			[20_000, 20_000 + 3_600_000, true],
+			[25_000, 25_000 + 3_600_000, true],
 		]);
 	});
 
-	it("reports nothing for a session without a stove", async () => {
-		const stove = fakeStove();
-		__test.stoveSessions.set("other", { stove });
+	it("tags evidence with its own session, provider and model, and nothing Claude-specific", async () => {
 		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
 		await streamSimple(model, { messages: [user("hi")], tools: [] }, { sessionId: "s1" }).result();
-		assert.deepEqual(stove.calls, []);
+		assert.equal(seen.evidence.length, 1);
+		const { identity, anchor, expiresAt, ...rest } = seen.evidence[0];
+		assert.equal(typeof identity, "string");
+		assert.deepEqual(rest, { version: 1, adapter: "claude-bridge", sessionId: "s1", provider: "claude-bridge", model: model.id, maintain: true });
 	});
 });
 
 describe("invalidation", () => {
 	it("a mirror marked for rebuild or dropped invalidates only its own session", () => {
-		const s1 = fakeStove(), s2 = fakeStove();
-		__test.stoveSessions.set("s1", { stove: s1 });
-		__test.stoveSessions.set("s2", { stove: s2 });
+		const count = () => seen.invalidate.filter((i) => i.sessionId === "s1").length;
 		__test.setSharedSession("s1", { sessionId: "cc-1", cursor: 1, cwd: "/tmp", needsRebuild: true });
-		assert.equal(s1.calls.filter((c) => c.kind === "invalidate").length, 1);
+		assert.equal(count(), 1);
 		__test.setSharedSession("s1", null);
-		assert.equal(s1.calls.filter((c) => c.kind === "invalidate").length, 2);
+		assert.equal(count(), 2);
 		__test.setSharedSession("s1", { sessionId: "cc-1", cursor: 1, cwd: "/tmp" });
-		assert.equal(s1.calls.filter((c) => c.kind === "invalidate").length, 2);
+		assert.equal(count(), 2);
 		__test.markRebuildForSession("s1", "session_compact");
-		assert.equal(s1.calls.filter((c) => c.kind === "invalidate").length, 3);
-		assert.deepEqual(s2.calls, []);
+		assert.equal(count(), 3);
+		assert.equal(seen.invalidate.length, 3, "no other session invalidated");
+		assert.ok(seen.invalidate.every((i) => i.version === 1 && i.adapter === "claude-bridge"));
+	});
+
+	it("a model or thinking change invalidates, and forgets the 1h chain the next read relied on", async () => {
+		for (const event of ["model_select", "thinking_level_select"]) {
+			__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), start("m2", usage(9_000, 0)), ...text("x"), result]));
+			await streamSimple(model, { messages: [user("hi")], tools: [] }, { sessionId: "s1" }).result();
+			assert.equal(seen.evidence.at(-1).maintain, true, "a read on a known 1h chain");
+			const ctx = { sessionManager: { getSessionId: () => "s1" } };
+			for (const h of handlers.get(event)) await h({ model }, ctx);
+			assert.equal(seen.invalidate.at(-1).sessionId, "s1");
+			const before = seen.evidence.length;
+			__test.resetSharedSession(); // a fresh conversation, so the turn reports as the session's own
+			__test.setQuery(fakeQuery([init("cc-1"), start("m3", usage(9_000, 0)), ...text("x"), result]));
+			await streamSimple(model, { messages: [user("hi")], tools: [] }, { sessionId: "s1" }).result();
+			assert.equal(seen.evidence.length, before + 1);
+			assert.equal(seen.evidence.at(-1).maintain, false, `${event}: the read prefix's lifetime is unknown again`);
+			__test.resetSharedSession();
+			__test.cacheSessions.clear();
+		}
 	});
 });
 
 describe("refresh recipe", () => {
 	it("replays the real query's options, with fork, no persistence and one turn added", async () => {
-		__test.stoveSessions.set("s1", { stove: fakeStove() });
 		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
 		await streamSimple(model, { messages: [user("hi")], tools: [readTool] }, { sessionId: "s1", reasoning: "high" }).result();
+		await settle(); // the query's teardown
 		const real = queries[0].options;
 
 		__test.setQuery(fakeQuery([init("cc-fork"), start("w1", usage(9_000, 10))]));
-		const got = await __test.refreshForSession("s1", new AbortController().signal, Date.now() + 60_000);
-		assert.equal(got.cache_read_input_tokens, 9_000);
+		const before = Date.now();
+		const got = await adapter().refresh(refreshReq("s1"));
+		assert.equal(got.sessionId, "s1");
+		assert.equal(got.identity, lastIdentity("s1"));
+		assert.ok(got.anchor >= before, "anchored at launch");
+		assert.equal(got.expiresAt, got.anchor + 3_600_000);
+		assert.equal(got.maintain, true);
 		const refresh = queries[1].options;
 		const ignored = new Set(["resume", "mcpServers", "debug", "debugFile", "stderr", "forkSession", "persistSession", "maxTurns"]);
 		for (const key of Object.keys(real)) {
@@ -187,8 +210,7 @@ describe("refresh recipe", () => {
 		assert.deepEqual(Object.keys(refresh.mcpServers), Object.keys(real.mcpServers));
 	});
 
-	it("follows a mid-query tool set change", async () => {
-		__test.stoveSessions.set("s1", { stove: fakeStove() });
+	it("follows a mid-query tool set change, which refuses a refresh for the older identity", async () => {
 		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
 		await streamSimple(model, { messages: [user("hi")], tools: [readTool] }, { sessionId: "s1" }).result();
 		const { QueryContext } = await import("../src/query-state.js");
@@ -198,29 +220,70 @@ describe("refresh recipe", () => {
 		c.toolNameToPi = new Map();
 		c.servedToolNames = ["read"];
 		await __test.syncServedTools(c, { messages: [], tools: [readTool, writeTool] });
-		assert.deepEqual(__test.stoveSessions.get("s1").recipe.tools.map((t) => t.name), ["read", "write"]);
+		assert.deepEqual(__test.cacheSessions.get("s1").recipe.tools.map((t) => t.name), ["read", "write"]);
+		await assert.rejects(adapter().refresh(refreshReq("s1")), /changed/);
+		assert.equal(queries.length, 1);
 	});
 
-	it("refuses to refresh a session whose mirror is missing or must be rebuilt", async () => {
-		__test.stoveSessions.set("s1", { stove: fakeStove() });
-		await assert.rejects(__test.refreshForSession("s1", new AbortController().signal, Date.now() + 60_000));
-		assert.equal(queries.length, 0);
+	it("refuses to refresh a session with no conversation, one that must be rebuilt, or one with an open query", async () => {
+		await assert.rejects(adapter().refresh({ sessionId: "s1", identity: "0", signal: new AbortController().signal, deadline: Date.now() + 60_000 }));
+		const g = gate();
+		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), g.wait, result]));
+		const open = streamSimple(model, { messages: [user("hi")], tools: [] }, { sessionId: "s1" });
+		await settle();
+		__test.setSharedSession("s1", { sessionId: "cc-1", cursor: 0, cwd: "/tmp" });
+		await assert.rejects(adapter().refresh(refreshReq("s1")), /still open/);
+		g.open();
+		await open.result();
+		await settle();
+		__test.setSharedSession("s1", { ...__test.getSharedSession("s1"), needsRebuild: true });
+		await assert.rejects(adapter().refresh({ ...refreshReq("s1"), identity: String(__test.cacheSessions.get("s1").epoch) }), /no current/);
+		assert.equal(queries.length, 1);
 	});
 
 	it("spawns nothing when cancelled or past its deadline while the runtimes load", async () => {
-		__test.stoveSessions.set("s1", { stove: fakeStove() });
 		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
 		await streamSimple(model, { messages: [user("hi")], tools: [readTool] }, { sessionId: "s1" }).result();
+		await settle();
 		__test.setQuery(fakeQuery([start("w1", usage(9_000, 10))]));
 		const controller = new AbortController();
-		const cancelled = __test.refreshForSession("s1", controller.signal, Date.now() + 60_000);
+		const cancelled = adapter().refresh(refreshReq("s1", { signal: controller.signal }));
 		controller.abort(); // lands while the loaders are awaited
 		await assert.rejects(cancelled);
 		mock.timers.enable({ apis: ["Date"], now: 1_000 });
-		const late = __test.refreshForSession("s1", new AbortController().signal, 2_000);
+		const late = adapter().refresh(refreshReq("s1", { deadline: 2_000 }));
 		mock.timers.tick(5_000); // the loaders took past the deadline
 		await assert.rejects(late, /deadline/);
 		assert.equal(queries.length, 1, "only the real query ever spawned");
+	});
+
+	it("a refresh invalidated while in flight teaches the bridge nothing when it resolves", async () => {
+		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
+		await streamSimple(model, { messages: [user("hi")], tools: [readTool] }, { sessionId: "s1" }).result();
+		await settle();
+		const g = gate();
+		__test.setQuery(fakeQuery([g.wait, start("w1", usage(9_000, 10))]));
+		const pending = adapter().refresh(refreshReq("s1"));
+		await settle();
+		assert.equal(queries.length, 2, "the refresh is in flight");
+		__test.markRebuildForSession("s1", "session_compact");
+		g.open();
+		await assert.rejects(pending, /changed/);
+		assert.equal(__test.cacheSessions.get("s1").known, null, "no chain restored for a later read to inherit");
+	});
+
+	it("spawns nothing when a real query starts while the runtimes load", async () => {
+		const g = gate();
+		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
+		await streamSimple(model, { messages: [user("hi")], tools: [readTool] }, { sessionId: "s1" }).result();
+		await settle();
+		const pending = adapter().refresh(refreshReq("s1"));
+		__test.setQuery(fakeQuery([init("cc-1"), g.wait, result]));
+		const real = streamSimple(model, { messages: [user("hi"), user("again")], tools: [readTool] }, { sessionId: "s1" });
+		await assert.rejects(pending, /still open|changed/);
+		assert.equal(queries.length, 2, "the real queries only");
+		g.open();
+		await real.result();
 	});
 });
 
@@ -284,82 +347,21 @@ describe("runRefresh", () => {
 	});
 });
 
-describe("/stove command", () => {
-	function tuiCtx(sessionId, branch = []) {
-		const statuses = new Map();
-		return {
-			statuses,
-			ctx: {
-				mode: "tui", hasUI: true, cwd: "/tmp",
-				model: { provider: "claude-bridge", id: "claude-opus-5-5" },
-				isIdle: () => true,
-				ui: { setStatus: (key, text) => (text === undefined ? statuses.delete(key) : statuses.set(key, text)), notify: () => {}, theme: { fg: (_c, s) => s } },
-				sessionManager: { getSessionId: () => sessionId, getBranch: () => branch, getEntries: () => branch },
-			},
-		};
-	}
-	const shown = (statuses) => [...statuses.values()].sort();
-
-	it("is off by default, toggles, persists intent, and shows paused until warmth is known", async () => {
-		const { ctx, statuses } = tuiCtx("t1");
-		const notifications = [];
-		ctx.ui.notify = (text) => notifications.push(text);
-		await emit("session_start", { reason: "startup" }, ctx);
-		assert.deepEqual(shown(statuses), ["cache ❄️"]);
-		await commands.get("stove").handler("", ctx);
-		assert.deepEqual(shown(statuses), ["cache ❄️", "stove ⏸"]);
-		assert.deepEqual(entries.at(-1).data, { enabled: true });
-		await commands.get("stove").handler("off", ctx);
-		assert.deepEqual(shown(statuses), ["cache ❄️"]);
-		assert.deepEqual(entries.at(-1).data, { enabled: false });
-		await commands.get("stove").handler("on", ctx);
-		assert.deepEqual(shown(statuses), ["cache ❄️", "stove ⏸"]);
-		assert.deepEqual(notifications, [], "toggles only update the footer");
-		await commands.get("stove").handler("status", ctx);
-		assert.equal(notifications.length, 1);
-		assert.match(notifications[0], /stove: paused/);
-		await emit("session_shutdown", { reason: "quit" }, ctx);
+describe("discovery", () => {
+	it("registers on a version 1 discover and at session_start, never on another version", async () => {
+		bus.emit("cache-stove:v1:discover", { version: 2 });
+		bus.emit("cache-stove:v1:discover", null);
+		assert.equal(seen.register.length, 0);
+		const ctx = { cwd: "/tmp", mode: "tui", ui: { notify() {} }, sessionManager: { getSessionId: () => "s9" } };
+		for (const h of handlers.get("session_start")) await h({ reason: "startup" }, ctx);
+		assert.equal(seen.register.length, 1);
+		const announced = seen.register[0];
+		assert.deepEqual({ ...announced, refresh: typeof announced.refresh }, { version: 1, id: "claude-bridge", provider: "claude-bridge", refresh: "function" });
+		assert.equal(adapter(), announced, "the same adapter answers discovery");
 	});
 
-	it("restores the intent on resume but never warm confidence", async () => {
-		const branch = [{ type: "custom", customType: "claude-bridge-stove", data: { enabled: true } }];
-		const { ctx, statuses } = tuiCtx("t2", branch);
-		await emit("session_start", { reason: "resume" }, ctx);
-		assert.deepEqual(shown(statuses), ["cache ❄️", "stove ⏸"]);
-		await emit("session_shutdown", { reason: "quit" }, ctx);
-	});
-
-	for (const enable of [true, false]) {
-		it(enable ? "/stove on refreshes a known 1h cache at its deadline, with no environment opt-in" : "a stove left off never refreshes", async () => {
-			delete process.env.CLAUDE_BRIDGE_STOVE_REFRESH;
-			mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000_000 });
-			const sid = enable ? "t-on" : "t-off";
-			const { ctx } = tuiCtx(sid);
-			await emit("session_start", { reason: "startup" }, ctx);
-			if (enable) await commands.get("stove").handler("on", ctx);
-			__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
-			await streamSimple(model, { messages: [user("hi")], tools: [readTool] }, { sessionId: sid }).result();
-			await new Promise((r) => setImmediate(r)); // the query's teardown, before pi settles
-			await emit("agent_settled", {}, ctx);
-			__test.setQuery(fakeQuery([start("w1", usage(9_000, 10))]));
-			mock.timers.tick(58 * 60_000); // estimated 1h expiry minus two minutes
-			for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
-			assert.equal(queries.length, enable ? 2 : 1);
-			if (enable) {
-				assert.equal(queries[1].options.forkSession, true);
-				assert.equal(queries[1].options.resume, "cc-1");
-			}
-			await emit("session_shutdown", { reason: "quit" }, ctx);
-		});
-	}
-
-	it("does not run in non-interactive sessions, even with a persisted intent", async () => {
-		const branch = [{ type: "custom", customType: "claude-bridge-stove", data: { enabled: true } }];
-		const { ctx, statuses } = tuiCtx("t3", branch);
-		ctx.mode = "print";
-		ctx.hasUI = false;
-		await emit("session_start", { reason: "startup" }, ctx);
-		assert.deepEqual(shown(statuses), []);
-		assert.equal(__test.stoveSessions.has("t3"), false);
+	it("registers no command, footer or preference of its own", () => {
+		assert.equal(handlers.has("agent_settled"), false);
+		assert.equal(handlers.has("cache_warming_decision"), false);
 	});
 });
