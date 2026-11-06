@@ -145,6 +145,14 @@ Requires the following in `~/.pi/agent/subagents.json`:
 {"promptInheritance": {"claude-bridge": "portable"}}
 ```
 
+## Stove
+
+In interactive sessions on a `claude-bridge` model the footer shows `cache 🔥` while this session's cached conversation prefix is believed unexpired, and `cache ❄️` otherwise. Expiry is an estimate: Claude Code does not report it, so the bridge infers it from each request's cache usage, counting the lifetime from when the request was sent. A 1 hour lifetime is assumed only when the usage proves it; anything else counts as 5 minutes. A rebuild, compaction, tree navigation, model or thinking change, or session switch cools it at once.
+
+`/stove` toggles a per-session keeper for that cache (`/stove on`, `/stove off`, `/stove status` for the reason behind each state). Off by default; the choice is saved in the session, never the warmth, so a resumed session starts cold. Print/JSON/RPC sessions and subagents never warm. The footer shows `stove ●` while it maintains the cache and `stove ⏸` while it is enabled but paused. While on, real requests keep moving the deadline; when the session sits idle, one refresh is sent two minutes before the estimated expiry of a known 1 hour cache. A 5 minute or unknown lifetime, a deadline missed through sleep, a failed refresh, or a refresh that missed the cache pauses it until a real request confirms the cache again. Nothing is retried.
+
+A live Opus 5.5/medium probe observed a 99% cache hit on a refresh at minute 58 and nearly 100% on a real follow-up at minute 65. The original session file stayed unchanged, no new session files appeared, and no tools ran. A refresh forks the session's Claude Code conversation (`resume` + `forkSession`, `persistSession: false`, `maxTurns: 1`), repeats the last real query's options and tool declarations with tools that refuse every call, and closes the child at the first `message_start`. It gives up, closing the child, 30 seconds before the estimated expiry or at Claude Code's first reported API retry; closing the child does not guarantee the upstream request is cancelled, and retries Claude Code does not report are not caught. The probe demonstrates cache reuse past the original expected expiry in that configuration; exact wire-prefix identity and output generated or billed after the early close remain unmeasured. A refresh that misses pays for rewriting the whole prefix once before the stove pauses. Warming addresses expiry only; it does not help with the rebuild misses below.
+
 ## Known issues
 
 **A session rebuild re-sends the whole conversation.** The bridge rewrites Claude Code's session from pi's history whenever the two diverge — after an abort, `/compact`, tree navigation, an API error, or on returning to a session — and the next request usually misses the prompt cache for everything past the system prompt. Abort-heavy sessions cost noticeably more.

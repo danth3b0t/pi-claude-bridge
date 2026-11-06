@@ -37,7 +37,7 @@ describe("agent_start widened-prompt capture", () => {
 			"the widened prompt must not resolve off the pre-widen record alone",
 		);
 
-		handlers.get("agent_start")({}, { getSystemPrompt: () => WIDENED });
+		handlers.get("agent_start")({}, { sessionManager: { getSessionId: () => "test-session" }, getSystemPrompt: () => WIDENED });
 		assert.ok(
 			__test.promptCaptures.resolveOrDerive(WIDENED),
 			"after agent_start the widened prompt resolves exactly",
@@ -47,7 +47,7 @@ describe("agent_start widened-prompt capture", () => {
 	it("lets a child embedding the widened parent resolve by inheritance", () => {
 		const handlers = activateWithMockPi();
 		handlers.get("before_agent_start")({ systemPrompt: PRE_WIDEN, systemPromptOptions: {} });
-		handlers.get("agent_start")({}, { getSystemPrompt: () => WIDENED });
+		handlers.get("agent_start")({}, { sessionManager: { getSessionId: () => "test-session" }, getSystemPrompt: () => WIDENED });
 
 		// pi-subagents embeds the widened parent prompt verbatim as the child's prefix.
 		const child = `${WIDENED}\n\n<sub_agent_context>be concise</sub_agent_context>\n\n<active_agent name="worker"/>`;
@@ -66,7 +66,7 @@ describe("agent_start widened-prompt capture", () => {
 			systemPrompt: PRE_WIDEN,
 			systemPromptOptions: { contextFiles, skills: [], selectedTools: ["read"] },
 		});
-		handlers.get("agent_start")({}, { getSystemPrompt: () => WIDENED });
+		handlers.get("agent_start")({}, { sessionManager: { getSessionId: () => "test-session" }, getSystemPrompt: () => WIDENED });
 
 		const capture = __test.promptCaptures.resolve(WIDENED);
 		assert.ok(capture, "widened key must be recorded");
@@ -83,7 +83,7 @@ describe("turn_start prompt capture", () => {
 			systemPrompt: PRE_WIDEN,
 			systemPromptOptions: { contextFiles, skills: [], selectedTools: ["read"] },
 		});
-		handlers.get("agent_start")({}, { getSystemPrompt: () => WIDENED });
+		handlers.get("agent_start")({}, { sessionManager: { getSessionId: () => "test-session" }, getSystemPrompt: () => WIDENED });
 
 		// A later in-run turn renders a new prompt (mid-run tool-loadout change,
 		// section re-render). turn_start re-keys it.
@@ -99,7 +99,7 @@ describe("turn_start prompt capture", () => {
 	it("is idempotent when the same prompt is re-fired", () => {
 		const handlers = activateWithMockPi();
 		handlers.get("before_agent_start")({ systemPrompt: PRE_WIDEN, systemPromptOptions: {} });
-		handlers.get("agent_start")({}, { getSystemPrompt: () => WIDENED });
+		handlers.get("agent_start")({}, { sessionManager: { getSessionId: () => "test-session" }, getSystemPrompt: () => WIDENED });
 
 		const before = __test.promptCaptures.size;
 		handlers.get("turn_start")({}, { getSystemPrompt: () => WIDENED });

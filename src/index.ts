@@ -31,6 +31,7 @@ import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
+import { Stove, runRefresh, type RefreshRecipe } from "./stove.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -258,6 +259,25 @@ function sessionStateFor(piSessionId: string | null | undefined): SessionState |
 function setSessionStateFor(piSessionId: string | null | undefined, state: SessionState | null): void {
 	if (state === null) sharedSessions.delete(sessionKey(piSessionId));
 	else sharedSessions.set(sessionKey(piSessionId), state);
+	// A dropped mirror or one due for a rebuild means the next request re-sends the
+	// conversation and misses the cache, whatever earlier requests confirmed.
+	if (state === null || state.needsRebuild) invalidateCache(piSessionId, state === null ? "session mirror dropped" : "session mirror needs a rebuild");
+}
+
+/** The stove of each interactive pi session (src/stove.ts), with the recipe of
+ *  its latest real query, which a refresh repeats, and the pi context and active
+ *  tool set it last saw. Keyed by real pi session id; non-interactive sessions,
+ *  subagents included, never get one. */
+interface StoveSession {
+	stove: Stove;
+	recipe?: RefreshRecipe;
+	ctx?: ExtensionContext;
+	activeTools?: string;
+}
+const stoveSessions = new Map<string, StoveSession>();
+
+function invalidateCache(piSessionId: string | null | undefined, reason: string): void {
+	if (piSessionId) stoveSessions.get(piSessionId)?.stove.invalidate(reason);
 }
 
 // pi replaced one of its sessions' history (compact, tree) rather than appending
@@ -310,6 +330,7 @@ function markRebuildForSession(piSession: string | null, event: string): void {
 	// parked (compaction runs inside pi's turn loop, not between provider calls).
 	if (piSession) historyRewrittenBySession.add(piSession);
 	armStaleContexts();
+	invalidateCache(piSession, event);
 }
 
 /** Copy each armed session's mark onto the parked queries built from it. */
@@ -930,6 +951,8 @@ export const __test = {
 	get promptCaptures() {
 		return promptCaptures;
 	},
+	stoveSessions,
+	refreshForSession,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -1121,6 +1144,10 @@ function toMcpToolDefs(tools: Tool[], queryCtx: QueryContext) {
 	}));
 }
 
+function toolDeclaration(tool: Tool): RefreshRecipe["tools"][number] {
+	return { name: tool.name, description: tool.description, inputSchema: tool.parameters };
+}
+
 function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ToolServer> | undefined {
 	if (!tools.length) return undefined;
 	return { [MCP_SERVER_NAME]: toolServerImpl!(MCP_SERVER_NAME, toMcpToolDefs(tools, queryCtx)) };
@@ -1141,6 +1168,10 @@ function syncServedTools(c: QueryContext, context: Context): Promise<void> | und
 	if (names.length === c.servedToolNames.length && names.every((name, i) => name === c.servedToolNames[i])) return undefined;
 	debug(`tool sync: served [${c.servedToolNames.join(",")}] → [${names.join(",")}]`);
 	c.servedToolNames = names;
+	// Tool declarations precede the conversation in the prompt: a refresh with the
+	// old set would miss the cache this query's next request writes.
+	const stoveSession = c.piSessionId ? stoveSessions.get(c.piSessionId) : undefined;
+	if (stoveSession?.recipe) stoveSession.recipe = { ...stoveSession.recipe, tools: mcpTools.map(toolDeclaration) };
 	// In place: consumeQuery holds this map. Dropping removed names matters as much
 	// as adding new ones — a call under a name we no longer serve must not reach pi.
 	c.toolNameToPi.clear();
@@ -1353,6 +1384,7 @@ function processStreamEvent(
 		c.turnStreamOpen = true;
 		c.turnStreamBlockStart = c.turnBlocks.length;
 		if (event.message?.usage) recordUsage(c.turnOutput, event.message.usage, model);
+		if (event.message?.usage && (message as { parent_tool_use_id?: string | null }).parent_tool_use_id == null) reportCacheUsage(c, event.message.usage);
 		return;
 	}
 
@@ -1452,6 +1484,21 @@ function processStreamEvent(
 	if (event?.type !== "message_stop" && event?.type !== "ping") {
 		debug("processStreamEvent: unhandled event type", event?.type);
 	}
+}
+
+/** Hand a main-thread request's cache usage to its session's stove.
+ *
+ *  A cache entry lives from when its request was sent, which is earlier than
+ *  this message_start arrives. The anchor is the latest moment the request is
+ *  known to have started after: the input that triggered it, or the previous
+ *  request's message_start when Claude Code sent another without new input
+ *  (a retry, a restream). Input delivered while a request is in flight would
+ *  break that, and the bridge delivers input only at the prompt and at tool
+ *  boundaries, where Claude Code's main thread is waiting rather than sending. */
+function reportCacheUsage(c: QueryContext, usage: SdkUsage): void {
+	const anchor = Math.max(c.inputDeliveredAt, c.lastMessageStartAt);
+	c.lastMessageStartAt = Date.now();
+	if (c.reportsCache && c.piSessionId) stoveSessions.get(c.piSessionId)?.stove.recordUsage(usage, anchor);
 }
 
 /** Remove the blocks of the message that just stopped which never got their own
@@ -1952,6 +1999,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (resultCtx) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx, options);
 		resultCtx.resetTurnState(model);
+		resultCtx.inputDeliveredAt = Date.now();
 		resultCtx.bindRunSignal?.(options?.signal, stream);
 		// A rewrite that armed the mark after this query parked gets copied here,
 		// though markRebuildForSession usually reaches it directly.
@@ -2240,8 +2288,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
+	// A query on a shorter, preserved context is not the session's conversation:
+	// its cache usage and options describe a different prefix.
+	queryCtx.reportsCache = !syncResult.preserveSharedSession;
+	const stoveSession = piSessionId ? stoveSessions.get(piSessionId) : undefined;
+	if (stoveSession && queryCtx.reportsCache) {
+		const { resume: _resume, mcpServers: _mcpServers, debug: _debug, debugFile: _debugFile, stderr: _stderr, ...recipeOptions } = queryOptions;
+		stoveSession.recipe = { options: recipeOptions, tools: mcpTools.map(toolDeclaration) };
+	}
+
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
+	queryCtx.inputDeliveredAt = Date.now();
+	queryCtx.lastMessageStartAt = 0;
 	const sdkQuery = (queryImpl ?? sdkQueryImpl)!({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
@@ -2405,6 +2464,39 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		});
 
 	return stream;
+}
+
+// --- Stove refresh ---
+
+/** One stove refresh for a pi session: its latest real query, repeated on a
+ *  fork of the conversation that query left behind (runRefresh). */
+async function refreshForSession(piSessionId: string, signal: AbortSignal, deadline: number): Promise<SdkUsage> {
+	const recipe = stoveSessions.get(piSessionId)?.recipe;
+	const state = sessionStateFor(piSessionId);
+	if (!recipe || !state || state.needsRebuild) throw new Error("no current Claude Code conversation to refresh");
+	const query = queryImpl ?? await loadSdkQuery();
+	const createToolServer = await loadToolServer();
+	debug(`stove: refreshing session ${state.sessionId.slice(0, 8)} for pi session ${piSessionId}`);
+	const usage = await runRefresh({
+		query,
+		createToolServer,
+		recipe: { ...recipe, options: { ...recipe.options, ...makeCliDebugOptions("stove") } },
+		resume: state.sessionId,
+		signal,
+		deadline,
+	});
+	debug(`stove: refresh usage in=${usage.input_tokens} cacheRead=${usage.cache_read_input_tokens} cacheWrite=${usage.cache_creation_input_tokens} breakdown=${JSON.stringify(usage.cache_creation ?? null)}`);
+	return usage;
+}
+
+/** Why a refresh must not run for this session now, or undefined when it may. */
+function stoveBlocker(piSessionId: string, session: StoveSession, activeTools: string): string | undefined {
+	if (session.ctx && !session.ctx.isIdle()) return "pi is busy";
+	if ([...activeQueryContexts].some((c) => c.piSessionId === piSessionId)) return "a Claude Code query is still open";
+	const state = sessionStateFor(piSessionId);
+	if (!state || state.needsRebuild) return "the conversation must be rebuilt by a real request first";
+	if (session.activeTools !== undefined && session.activeTools !== activeTools) return "the active tools changed since the last request";
+	return undefined;
 }
 
 // --- AskClaude: prompt and wait ---
@@ -2664,7 +2756,83 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
 		}
+		startStove(ctx);
 	});
+
+	// --- Stove (src/stove.ts) ---
+	//
+	// Interactive sessions only: a print/json run, an RPC host or a subagent must
+	// not start warming because a session it loads once had the stove on. The
+	// intent is persisted as a custom entry; warmth never is, so a restored session
+	// starts cold and paused until a real request confirms the cache.
+	const STOVE_ENTRY = "claude-bridge-stove";
+	const activeToolsKey = () => [...pi.getActiveTools()].sort().join(",");
+	function stopStove(piSessionId: string): void {
+		stoveSessions.get(piSessionId)?.stove.dispose();
+		stoveSessions.delete(piSessionId);
+	}
+	function startStove(ctx: ExtensionContext): void {
+		const piSessionId = ctx.sessionManager.getSessionId();
+		stopStove(piSessionId);
+		if (ctx.mode !== "tui") return;
+		const session: StoveSession = {
+			ctx,
+			stove: new Stove({
+				now: Date.now,
+				setTimer: (fn, ms) => setTimeout(fn, ms).unref(),
+				clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+				render: (view) => {
+					ctx.ui.setStatus("claude-bridge-cache", view ? `cache ${view.cache === "hot" ? "🔥" : "❄️"}` : undefined);
+					ctx.ui.setStatus("claude-bridge-stove", view && view.stove !== "off" ? `stove ${view.stove === "on" ? "●" : "⏸"}` : undefined);
+				},
+				blocker: () => stoveBlocker(piSessionId, session, activeToolsKey()),
+				refresh: (signal, deadline) => refreshForSession(piSessionId, signal, deadline),
+			}),
+		};
+		stoveSessions.set(piSessionId, session);
+		const saved = ctx.sessionManager.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === STOVE_ENTRY)
+			.at(-1) as { data?: { enabled?: boolean } } | undefined;
+		if (saved?.data?.enabled) session.stove.setEnabled(true);
+		session.stove.setSupported(ctx.model?.provider === PROVIDER_ID);
+	}
+	pi.registerCommand("stove", {
+		description: "Keep this session's Claude prompt cache warm while idle: /stove [on|off|status]",
+		getArgumentCompletions: (prefix) => {
+			const items = ["on", "off", "status"].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
+			return items.length ? items : null;
+		},
+		handler: async (args, ctx) => {
+			const session = stoveSessions.get(ctx.sessionManager.getSessionId());
+			if (!session) {
+				ctx.ui.notify("The stove runs only in interactive sessions.", "warning");
+				return;
+			}
+			const arg = args.trim().toLowerCase();
+			const on = arg === "" ? !session.stove.enabled : arg === "on" ? true : arg === "off" ? false : undefined;
+			if (arg !== "status" && on === undefined) {
+				ctx.ui.notify("Usage: /stove [on|off|status]", "warning");
+				return;
+			}
+			if (on !== undefined && on !== session.stove.enabled) {
+				session.stove.setEnabled(on);
+				pi.appendEntry(STOVE_ENTRY, { enabled: on });
+			}
+			if (arg === "status") ctx.ui.notify(session.stove.describe(), "info");
+		},
+	});
+	pi.on("agent_settled", (_event, ctx) => {
+		const session = stoveSessions.get(ctx.sessionManager.getSessionId());
+		if (!session) return;
+		session.activeTools = activeToolsKey();
+		session.stove.setBusy(false);
+	});
+	pi.on("model_select", (event, ctx) => {
+		const session = stoveSessions.get(ctx.sessionManager.getSessionId());
+		session?.stove.invalidate("the model changed");
+		session?.stove.setSupported(event.model.provider === PROVIDER_ID);
+	});
+	pi.on("thinking_level_select", (_event, ctx) => invalidateCache(ctx.sessionManager.getSessionId(), "the thinking level changed"));
 	pi.on("session_before_compact", (event, ctx) => {
 		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
 	});
@@ -2716,6 +2884,7 @@ export default function (pi: ExtensionAPI) {
 	// buildSystemPrompt renders verbatim.
 	pi.on("agent_start", (_event, ctx) => {
 		recordSystemPrompt("agent_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+		stoveSessions.get(ctx.sessionManager.getSessionId())?.stove.setBusy(true);
 	});
 
 	// Mid-run re-renders: turn_start fires before every turn (first turn included)
@@ -2729,6 +2898,7 @@ export default function (pi: ExtensionAPI) {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
+		stopStove(ctx.sessionManager.getSessionId());
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");

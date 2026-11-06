@@ -18,6 +18,9 @@ export type SdkUsage = {
 	output_tokens?: number | null;
 	cache_read_input_tokens?: number | null;
 	cache_creation_input_tokens?: number | null;
+	/** Lifetime split of cache_creation_input_tokens. pi's Usage has no place for it;
+	 *  the stove reads it to know how long a write keeps the prefix warm. */
+	cache_creation?: { ephemeral_1h_input_tokens?: number | null; ephemeral_5m_input_tokens?: number | null } | null;
 	output_tokens_details?: { thinking_tokens?: number | null } | null;
 };
 

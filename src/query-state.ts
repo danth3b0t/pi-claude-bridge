@@ -78,6 +78,15 @@ export class QueryContext {
 	/** A steer never reached CC. A first query has no session mirror yet, so
 	 *  completion must carry this into the mirror it creates. */
 	missedSteer = false;
+	/** This query runs on its pi session's own conversation, so its cache usage
+	 *  describes the prefix that session's stove tracks. */
+	reportsCache = false;
+	/** When pi last handed this query input (the prompt at spawn, tool results).
+	 *  A request cannot have started before it: the earliest safe cache anchor. */
+	inputDeliveredAt = 0;
+	/** When the last main-thread message_start arrived. Claude Code's main thread
+	 *  sends one request at a time, so the next one started after this. */
+	lastMessageStartAt = 0;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
