@@ -26,23 +26,32 @@ describe("classifyCacheUsage", () => {
 		assert.deepEqual(pick(classifyCacheUsage(cold1h, null)), { confirmed: true, ttl: "1h" });
 	});
 
-	it("new 1h writes do not prove the TTL of the prefix they read", () => {
-		assert.equal(classifyCacheUsage(readWrite1h, null).ttl, "unknown");
-		assert.equal(classifyCacheUsage(readWrite1h, "1h").ttl, "1h");
+	it("exclusive 1h writes establish a 1h prefix regardless of prior read lifetime", () => {
+		for (const prior of [null, "unknown", "5m", "1h"]) {
+			assert.equal(classifyCacheUsage(readWrite1h, prior).ttl, "1h");
+		}
 	});
 
 	it("a pure read keeps the known TTL of its chain and is unknown without one", () => {
 		assert.equal(classifyCacheUsage(pureRead, "1h").ttl, "1h");
 		assert.equal(classifyCacheUsage(pureRead, null).ttl, "unknown");
+		assert.equal(classifyCacheUsage(pureRead, "5m").ttl, "5m");
 	});
 
 	it("any 5m write makes the shortest lifetime 5m, even on a 1h chain", () => {
 		assert.equal(classifyCacheUsage(write5m, "1h").ttl, "5m");
+		assert.equal(classifyCacheUsage({ ...readWrite1h,
+			cache_creation: { ephemeral_5m_input_tokens: 1, ephemeral_1h_input_tokens: 682 },
+		}, "1h").ttl, "5m");
 	});
 
 	it("writes without a TTL breakdown are unknown, not 1h", () => {
 		const { cache_creation, ...noBreakdown } = cold1h;
 		assert.equal(classifyCacheUsage(noBreakdown, null).ttl, "unknown");
+		assert.equal(classifyCacheUsage({ ...readWrite1h, cache_creation: undefined }, "1h").ttl, "unknown");
+		assert.equal(classifyCacheUsage({ ...readWrite1h,
+			cache_creation: { ephemeral_1h_input_tokens: 682 },
+		}, "1h").ttl, "unknown");
 	});
 
 	it("an uncached tail is allowed but a mostly uncached prompt confirms nothing", () => {
@@ -80,9 +89,12 @@ describe("estimateCache", () => {
 		assert.equal(estimateCache(pureRead, known, t0 + HOUR).estimate.maintain, false);
 	});
 
-	it("after an invalidation, 1h writes on a read prefix stay unknown until a cold 1h write", () => {
-		assert.equal(estimateCache(readWrite1h, null, t0).estimate.maintain, false);
-		assert.equal(estimateCache(cold1h, null, t0).estimate.maintain, true);
+	it("after an invalidation, reads with exclusive 1h writes re-establish maintenance", () => {
+		const { known, estimate } = estimateCache(readWrite1h, null, t0);
+		assert.deepEqual(estimate, { expiresAt: t0 + HOUR, maintain: true });
+		assert.equal(known.ttl, "1h");
+		assert.deepEqual(estimateCache(readWrite1h, null, t0, true).estimate,
+			{ expiresAt: t0 + HOUR, maintain: true });
 	});
 
 	it("a request that confirms nothing reports no warmth and forgets the chain", () => {

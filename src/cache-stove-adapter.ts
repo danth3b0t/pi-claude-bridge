@@ -36,10 +36,11 @@ export const MIN_CACHED_SHARE = 0.9;
  * What one request's usage proves about the cached prefix.
  *
  * `priorTtl` is the lifetime already known for the prefix this request read, or
- * null when nothing is known about it. A read never reveals the lifetime of the
- * entry it hit, and new writes at 1h say nothing about the entries before them,
- * so a read of an unknown prefix stays unknown. Mixed lifetimes resolve to the
- * shortest: 5m is the floor, so a 5m write is known even next to an unknown read.
+ * null when nothing is known about it. A pure read preserves that lifetime.
+ * A new entry covers the full prefix through its breakpoint, so exclusive 1h
+ * writes establish a 1h prefix even alongside reads with no prior lifetime.
+ * Mixed writes use the shortest lifetime; incomplete write evidence is unknown.
+ * https://platform.claude.com/docs/en/build-with-claude/prompt-caching#mixing-different-ttls
  */
 export function classifyCacheUsage(usage: SdkUsage, priorTtl: CacheTtl | null): { confirmed: boolean; ttl?: CacheTtl; readShare: number } {
 	const input = usage.input_tokens ?? 0;
@@ -48,10 +49,7 @@ export function classifyCacheUsage(usage: SdkUsage, priorTtl: CacheTtl | null): 
 	const total = input + read + write;
 	const readShare = total > 0 ? read / total : 0;
 	if (total === 0 || (read + write) / total < MIN_CACHED_SHARE) return { confirmed: false, readShare };
-	const lifetimes: CacheTtl[] = [];
-	if (read > 0) lifetimes.push(priorTtl ?? "unknown");
-	if (write > 0) lifetimes.push(writeTtl(usage, write));
-	const ttl = lifetimes.includes("5m") ? "5m" : lifetimes.includes("unknown") ? "unknown" : "1h";
+	const ttl = write > 0 ? writeTtl(usage, write) : priorTtl ?? "unknown";
 	return { confirmed: true, ttl, readShare };
 }
 
