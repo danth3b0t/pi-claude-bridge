@@ -274,6 +274,8 @@ interface CacheSession {
 	recipe?: RefreshRecipe;
 	model?: Model<any>;
 	known?: KnownCache | null;
+	/** The Claude model and effort `known` describes: each caches its own prefix. */
+	knownFor?: string;
 }
 const cacheSessions = new Map<string, CacheSession>();
 /** pi's event bus, where the stove listens. Null until the extension activates. */
@@ -2325,6 +2327,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		cached.recipe = { options: recipeOptions, tools: mcpTools.map(toolDeclaration) };
 		cached.model = model;
 		cached.epoch++;
+		// A read in another model or effort is of that one's prefix, which never
+		// inherits the lifetime confirmed for this one.
+		const knownFor = `${cliModel} ${effort ?? "default"}`;
+		if (cached.knownFor !== knownFor) cached.known = null;
+		cached.knownFor = knownFor;
 	}
 
 	// 3. Start SDK query and claim it for this context
@@ -2809,8 +2816,9 @@ export default function (pi: ExtensionAPI) {
 	pi.events?.on(CACHE_STOVE.discover, (data) => {
 		if ((data as { version?: unknown } | null)?.version === CACHE_STOVE.version) announceCacheAdapter();
 	});
-	pi.on("model_select", (_event, ctx) => invalidateCache(ctx.sessionManager.getSessionId(), "the model changed"));
-	pi.on("thinking_level_select", (_event, ctx) => invalidateCache(ctx.sessionManager.getSessionId(), "the thinking level changed"));
+	// Selecting another model or thinking level is not invalidated here: it sends
+	// nothing, so the cached prefix stays warm for when it is selected again. The
+	// stove tracks which selection its evidence was confirmed for.
 	pi.on("session_before_compact", (event, ctx) => {
 		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
 	});

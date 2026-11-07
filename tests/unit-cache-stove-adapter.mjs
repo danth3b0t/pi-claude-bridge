@@ -4,7 +4,7 @@
  *
  * Drives real provider turns with a mocked SDK query() (see setQuery), so what is
  * pinned is the bridge's side of the contract: which request each evidence report
- * is anchored to, which session events invalidate, discovery, and that a refresh
+ * is anchored to, which session events invalidate (and which do not), discovery, and that a refresh
  * replays the real query's recipe with only the isolation overrides added. Whether
  * Claude Code honours that recipe byte-for-byte is a live question this file
  * cannot answer.
@@ -163,23 +163,27 @@ describe("invalidation", () => {
 		assert.ok(seen.invalidate.every((i) => i.version === 1 && i.adapter === "claude-bridge"));
 	});
 
-	it("a model or thinking change invalidates, and forgets the 1h chain the next read relied on", async () => {
-		for (const event of ["model_select", "thinking_level_select"]) {
-			__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), start("m2", usage(9_000, 0)), ...text("x"), result]));
-			await streamSimple(model, { messages: [user("hi")], tools: [] }, { sessionId: "s1" }).result();
-			assert.equal(seen.evidence.at(-1).maintain, true, "a read on a known 1h chain");
-			const ctx = { sessionManager: { getSessionId: () => "s1" } };
-			for (const h of handlers.get(event)) await h({ model }, ctx);
-			assert.equal(seen.invalidate.at(-1).sessionId, "s1");
-			const before = seen.evidence.length;
+	it("selecting a model or thinking level invalidates nothing; a request in another model or effort starts its own chain", async () => {
+		assert.equal(handlers.has("model_select"), false);
+		assert.equal(handlers.has("thinking_level_select"), false);
+		const sonnet = providerConfig.models.find((m) => m.id === "claude-sonnet-5-5");
+		const turn = async (m, reasoning) => {
 			__test.resetSharedSession(); // a fresh conversation, so the turn reports as the session's own
-			__test.setQuery(fakeQuery([init("cc-1"), start("m3", usage(9_000, 0)), ...text("x"), result]));
-			await streamSimple(model, { messages: [user("hi")], tools: [] }, { sessionId: "s1" }).result();
-			assert.equal(seen.evidence.length, before + 1);
-			assert.equal(seen.evidence.at(-1).maintain, false, `${event}: the read prefix's lifetime is unknown again`);
-			__test.resetSharedSession();
-			__test.cacheSessions.clear();
-		}
+			__test.setQuery(fakeQuery([init("cc-1"), start(`m${ts}`, usage(9_000, 0)), ...text("x"), result]));
+			await streamSimple(m, { messages: [user("hi")], tools: [] }, { sessionId: "s1", reasoning }).result();
+			return seen.evidence.at(-1).maintain;
+		};
+		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
+		await streamSimple(model, { messages: [user("hi")], tools: [] }, { sessionId: "s1", reasoning: "medium" }).result();
+		assert.equal(await turn(model, "medium"), true, "a read on the known 1h chain");
+		assert.equal(await turn(model, "high"), false, "another effort's read has an unknown lifetime");
+		assert.equal(await turn(model, "medium"), false, "the chain is not restored by switching back");
+		__test.cacheSessions.clear();
+		__test.setQuery(fakeQuery([init("cc-1"), start("m1", usage(0, 9_000)), ...text("x"), result]));
+		await streamSimple(model, { messages: [user("hi")], tools: [] }, { sessionId: "s1", reasoning: "medium" }).result();
+		assert.equal(await turn(sonnet, "medium"), false, "another model's read has an unknown lifetime");
+		assert.equal(seen.invalidate.length, 0);
+		__test.resetSharedSession();
 	});
 });
 
