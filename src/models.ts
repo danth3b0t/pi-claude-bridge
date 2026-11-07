@@ -48,6 +48,10 @@ export function buildModels<T extends { id: string; [key: string]: any }>(piAiMo
 			reasoning, input, contextWindow, maxTokens,
 			thinkingLevelMap,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			// Tells pi a warm request (src/cache-warm.ts) keeps the cache. Claude Code picks
+			// the lifetime, 5 minutes or 1 hour by plan, whatever retention pi asks for, and
+			// pi takes the conservative end of a range.
+			promptCache: { short: 300, long: 300 },
 		}));
 }
 

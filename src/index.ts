@@ -28,6 +28,7 @@ import {
 } from "./prompt-capture.js";
 import { collectCarriedAttachments } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
+import { firstRequestUsage, isCacheWarm, WARM_PROMPT, warmRefusal } from "./cache-warm.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
@@ -840,6 +841,71 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 	return { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, mcpTools) };
 }
 
+/** The options every provider-path Claude Code query shares: a turn's, and a cache
+ *  warm's, which must send the same request prefix as the turn whose cache it keeps. */
+function providerQueryOptions(a: {
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+	cliModel: string;
+	systemPromptAppend: string | undefined;
+	effort: EffortLevel | undefined;
+	thinking: ThinkingConfig | undefined;
+	mcpServers: Record<string, ReturnType<typeof createToolServer>> | undefined;
+	cliDebug: ReturnType<typeof makeCliDebugOptions>;
+}): NonNullable<Parameters<typeof query>[0]["options"]> {
+	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
+	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
+	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
+	// programmatically and ignore filesystem MCP entries.
+	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
+	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
+
+	const extraArgs: Record<string, string | null> = { "replay-user-messages": null };
+	// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
+	// Force summarized so thinking_delta events arrive. See anthropics/claude-agent-sdk-python#830.
+	if (a.effort) extraArgs["thinking-display"] = "summarized";
+
+	return {
+		cwd: a.cwd,
+		env: a.env,
+		tools: [],
+		permissionMode: "bypassPermissions",
+		includePartialMessages: true,
+		// User settings only. A repo's .claude/settings.json and settings.local.json can
+		// carry hooks, apiKeyHelper, env and plugins, and Claude Code trusts the workspace
+		// when it isn't interactive, so they would run with no prompt. ~/.claude/settings.json
+		// still loads: Bedrock/Vertex users keep env and apiKeyHelper there.
+		settingSources: ["user"] as SettingSource[],
+		// includeGitInstructions:false drops the gitStatus block from the preset.
+		// That block is the trailing suffix of the cached system block, and a
+		// git-state transition (new file, staging, commit) rewrites it — busting
+		// the prompt cache for the whole conversation from there on (see
+		// diag/probe-git-cache.mjs). The bridge re-invokes CC per turn, so this
+		// hit on every transition. Cost here is nil: the setting also strips
+		// CC's git-workflow guidance from its Bash tool prompt, but the provider
+		// path runs CC with `tools: []`, so those definitions never ship.
+		settings: {
+			...claudeCodeSettings(providerSettings),
+			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
+			includeGitInstructions: false,
+			// A user's output style is persona text written for standalone Claude Code; pi owns the persona here.
+			outputStyle: "default",
+		},
+		systemPrompt: {
+			type: "preset", preset: "claude_code",
+			append: a.systemPromptAppend ? a.systemPromptAppend : undefined,
+		},
+		model: a.cliModel,
+		strictMcpConfig: strictMcpConfigEnabled,
+		extraArgs,
+		...(a.effort ? { effort: a.effort } : {}),
+		...(a.thinking ? { thinking: a.thinking } : {}),
+		...(a.mcpServers ? { mcpServers: a.mcpServers } : {}),
+		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+		...a.cliDebug,
+	};
+}
+
 // --- Usage helpers ---
 
 // One process serves several pi sessions at once (in-process subagents), so log
@@ -1645,6 +1711,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		traceEvent("route", { callId: traceCallId, route: "isolated-summary" });
 		return isolatedStreamFn(model, context, options, traceCallId);
 	}
+	// pi's prompt-cache warm (src/cache-warm.ts): never a turn, never synced.
+	if (isCacheWarm(options)) {
+		traceEvent("route", { callId: traceCallId, route: "cache-warm" });
+		return warmStreamFn(model, context, options!);
+	}
 
 	const stream = createAssistantMessageEventStream();
 	// Report a failure before any query exists on the stream, as pi-ai's provider
@@ -1876,20 +1947,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		queryCtx.promptStream = promptStream;
 		const mcpServers = buildMcpServers(mcpTools, queryCtx);
 
-		// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
-		// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
-		// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
-		// programmatically and ignore filesystem MCP entries.
-		const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
-		const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
-
 		const effort = effortForReasoning(model, options?.reasoning);
 		const thinking = thinkingForReasoning(model, options?.reasoning);
-
-		const extraArgs: Record<string, string | null> = { "replay-user-messages": null };
-		// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
-		// Force summarized so thinking_delta events arrive. See anthropics/claude-agent-sdk-python#830.
-		if (effort) extraArgs["thinking-display"] = "summarized";
 
 		// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
 		// when the user is logged into Anthropic). These are a separate code path from
@@ -1909,55 +1968,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const cliDebug = makeCliDebugOptions("provider");
 		const childProcess = new QueryProcess(cliDebug.stderr);
 		const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
-			cwd,
-			env: childEnv,
-			tools: [],
-			permissionMode: "bypassPermissions",
-			includePartialMessages: true,
-			// User settings only. A repo's .claude/settings.json and settings.local.json can
-			// carry hooks, apiKeyHelper, env and plugins, and Claude Code trusts the workspace
-			// when it isn't interactive, so they would run with no prompt. ~/.claude/settings.json
-			// still loads: Bedrock/Vertex users keep env and apiKeyHelper there.
-			settingSources: ["user"] as SettingSource[],
-			// includeGitInstructions:false drops the gitStatus block from the preset.
-			// That block is the trailing suffix of the cached system block, and a
-			// git-state transition (new file, staging, commit) rewrites it — busting
-			// the prompt cache for the whole conversation from there on (see
-			// diag/probe-git-cache.mjs). The bridge re-invokes CC per turn, so this
-			// hit on every transition. Cost here is nil: the setting also strips
-			// CC's git-workflow guidance from its Bash tool prompt, but the provider
-			// path runs CC with `tools: []`, so those definitions never ship.
-			settings: {
-				...claudeCodeSettings(providerSettings),
-				claudeMdExcludes: CLAUDE_MD_EXCLUDES,
-				includeGitInstructions: false,
-				// A user's output style is persona text written for standalone Claude Code; pi owns the persona here.
-				outputStyle: "default",
-			},
-			systemPrompt: {
-				type: "preset", preset: "claude_code",
-				append: systemPromptAppend ? systemPromptAppend : undefined,
-			},
-			model: cliModel,
-			strictMcpConfig: strictMcpConfigEnabled,
-			extraArgs,
-			...(effort ? { effort } : {}),
-			...(thinking ? { thinking } : {}),
-			...(mcpServers ? { mcpServers } : {}),
+			...providerQueryOptions({ cwd, env: childEnv, cliModel, systemPromptAppend, effort, thinking, mcpServers, cliDebug }),
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(syncResult.forkAt ? { forkSession: true, resumeSessionAt: syncResult.forkAt } : {}),
 			// --session-id names a fresh launch or a fork's target; a prewritten
 			// import resumes its own id, and CC rejects --session-id beside it.
 			...(syncResult.created && (!resumeSessionId || syncResult.forkAt) ? { sessionId: syncResult.targetSessionId } : {}),
-			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-			...cliDebug,
 			spawnClaudeCodeProcess: childProcess.spawn,
 		};
 
 		debug("provider: fresh query",
 			`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 			`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
-			`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled} ${sessionTag(queryCtx.piSessionId)}`,
+			`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${providerSettings.strictMcpConfig !== false} ${sessionTag(queryCtx.piSessionId)}`,
 			`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
 		// 3. Start SDK query and claim it for this context
@@ -2133,6 +2156,87 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		endStream(stream, { type: "error", reason: output.stopReason as "error" | "aborted", error: output });
 		queryCtx.currentPiStream = null;
 	});
+	return stream;
+}
+
+// --- Prompt-cache warm (src/cache-warm.ts) ---
+
+const WARM_TOOL_REFUSAL: McpResult = { content: [{ type: "text", text: "Tool use is disabled during a prompt cache refresh." }], isError: true };
+
+/** Answers pi's warm request from a non-persisted fork of the session's Claude Code
+ *  conversation, with the options the turn it warms used and its tools refused.
+ *  Refuses rather than waits when the session is busy or would be rebuilt. */
+function warmStreamFn(model: Model<any>, context: Context, options: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	const piSessionId = options.sessionId!;
+	void (async () => {
+		let child: ReturnType<typeof query> | undefined;
+		let childProcess: QueryProcess | undefined;
+		let onAbort = () => {};
+		try {
+			const queryOpen = () => [...activeQueryContexts].some((c) => c.piSessionId === piSessionId);
+			if (queryOpen()) throw new Error("a Claude Code query is open for this session");
+			// The last turn's child may still be flushing the transcript the fork reads.
+			await waitForSessionWriter(sessionStateFor(piSessionId)?.ccSessionId, options.signal);
+			if (queryOpen()) throw new Error("a Claude Code query is open for this session");
+			const state = sessionStateFor(piSessionId);
+			const { mcpTools } = resolveMcpTools(context);
+			const promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
+			const systemPromptAppend = promptCapture
+				? projectPromptCapture(promptCapture, { hasReadTool: mcpTools.some((tool) => tool.name === "read") })
+				: undefined;
+			const cwd = sessionCwdFor(piSessionId);
+			const cliModel = claudeCodeModelId(model, longContextSettings);
+			const refusal = warmRefusal(state, digestMessages(nonSystemMessages(context.messages)), {
+				model: cliModel,
+				promptDigest: createHash("sha256").update(systemPromptAppend ?? "").digest("hex"),
+				cwdChanged: Boolean(state && safeRealpath(state.cwd) !== safeRealpath(cwd)),
+			});
+			if (refusal) throw new Error(`nothing to warm: ${refusal}`);
+			options.signal?.throwIfAborted();
+			const tools = mcpTools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters, handler: async () => WARM_TOOL_REFUSAL }));
+			const cliDebug = makeCliDebugOptions("warm");
+			childProcess = new QueryProcess(cliDebug.stderr);
+			debug(`warm: forking session ${state!.ccSessionId.slice(0, 8)} model=${cliModel} ${sessionTag(piSessionId)}`);
+			child = queryImpl({
+				prompt: WARM_PROMPT,
+				options: {
+					...providerQueryOptions({
+						cwd, env: ccChildEnv(options.env), cliModel, systemPromptAppend,
+						effort: effortForReasoning(model, options.reasoning),
+						thinking: thinkingForReasoning(model, options.reasoning),
+						mcpServers: tools.length ? { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, tools) } : undefined,
+						cliDebug,
+					}),
+					resume: state!.ccSessionId,
+					forkSession: true,
+					persistSession: false,
+					maxTurns: 1,
+					spawnClaudeCodeProcess: childProcess.spawn,
+				},
+			});
+			const aborted = new Promise<never>((_, reject) => {
+				onAbort = () => reject(new Error("warm request aborted"));
+				options.signal?.addEventListener("abort", onAbort, { once: true });
+			});
+			const usage = await Promise.race([firstRequestUsage(child), aborted]);
+			const output = newAssistantOutput(model, "", "stop");
+			const report = updateUsage(output, usage, model);
+			debug(`warm: usage in=${output.usage.input} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} cacheWrite1h=${output.usage.cacheWrite1h ?? "none"} cachePct=${report.cachePct}% ${sessionTag(piSessionId)}`);
+			endStream(stream, { type: "done", reason: "stop", message: output });
+		} catch (error) {
+			const reason = options.signal?.aborted ? "aborted" : "error";
+			debug(`warm: ${reason}: ${errorMessage(error)} ${sessionTag(piSessionId)}`);
+			endStream(stream, { type: "error", reason, error: newAssistantOutput(model, "", reason, errorMessage(error)) });
+		} finally {
+			options.signal?.removeEventListener("abort", onAbort);
+			if (child) {
+				void child.interrupt().catch(() => {});
+				try { child.close(); } catch {}
+			}
+			childProcess?.terminate();
+		}
+	})();
 	return stream;
 }
 

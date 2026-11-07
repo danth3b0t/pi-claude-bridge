@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Add: pi's prompt-cache warming** — a warm request (a session's last request re-sent with `maxTokens: 1`, as pi's cache warmer and extensions calling `modelRegistry.streamSimple` send it) no longer starts a turn. It resumes a non-persisted fork of the session's Claude Code conversation with the same options as the turn it warms, refuses every tool, and closes at the first request's usage, which it returns as the reply's usage. It is refused, spawning nothing, when the session has no conversation, a query of it is open, or the next turn would rebuild it (another model, system prompt or working directory, or history the conversation did not record). Models now declare `promptCache` (5 minutes, the shorter lifetime Claude Code uses); with the bridge's zero prices pi's own warmer still never sends one. Covered by `tests/unit-cache-warm.mjs`.
+
 ## 0.11.0 — 2026-11-06
 
 - **Breaking: AskClaude moved to its own package** — Run `pi install npm:pi-claude-bridge-askclaude` if you want to keep using the AskClaude tool.
