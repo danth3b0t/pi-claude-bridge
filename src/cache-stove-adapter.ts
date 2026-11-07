@@ -32,6 +32,12 @@ export const CACHE_STOVE = {
  *  at the end of the prompt, so only a short tail is ever legitimately uncached. */
 export const MIN_CACHED_SHARE = 0.9;
 
+/** Share of the prompt a refresh must read from cache to count as maintaining it.
+ *  Below this it rewrote the prefix, and refreshing again would pay that at every
+ *  deadline. Lower than MIN_CACHED_SHARE: turns are seen to rewrite a few hundred
+ *  tokens before the tail, which is cheap to keep paying for and is no miss. */
+export const MIN_REFRESH_READ_SHARE = 0.8;
+
 /**
  * What one request's usage proves about the cached prefix.
  *
@@ -85,7 +91,7 @@ export function estimateCache(usage: SdkUsage, known: KnownCache | null, anchor:
 	const next = { anchor, expiresAt: anchor + TTL_MS[ttl === "1h" ? "1h" : "5m"], ttl };
 	const reason = ttl === "5m" ? "the cache lifetime is 5 minutes; only a 1 hour cache is maintained"
 		: ttl === "unknown" ? "the cache lifetime is not known to be 1 hour"
-		: refresh && evidence.readShare < MIN_CACHED_SHARE ? "the last refresh missed the cache and rewrote it"
+		: refresh && evidence.readShare < MIN_REFRESH_READ_SHARE ? "the last refresh missed the cache and rewrote it"
 		: undefined;
 	return { known: next, estimate: { expiresAt: next.expiresAt, maintain: reason === undefined, ...(reason ? { reason } : {}) } };
 }

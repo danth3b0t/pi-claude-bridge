@@ -116,4 +116,13 @@ describe("estimateCache", () => {
 		assert.equal(nothing.known, known);
 		assert.equal(estimateCache(pureRead, known, t0 + 58 * MIN, true).estimate.maintain, true);
 	});
+
+	it("a refresh is maintained down to 80% read from cache, and not below", () => {
+		const { known } = estimateCache(cold1h, null, t0);
+		const refresh = (read) => estimateCache({ input_tokens: 0, cache_read_input_tokens: read, cache_creation_input_tokens: 1_000 - read,
+			cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 1_000 - read } }, known, t0 + 58 * MIN, true).estimate;
+		assert.equal(refresh(800).maintain, true, "80% read: a rewritten tail");
+		assert.equal(refresh(799).maintain, false);
+		assert.match(refresh(799).reason, /missed the cache/);
+	});
 });
