@@ -56,15 +56,7 @@ function diagDump(label: string, data: Record<string, unknown>) {
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 
 // MODELS is buildModels(getModels("anthropic")) — projection kept in models.js.
-// Fable 5.2 (released 2026-11-09) predates pi-ai's catalog; it shares Fable 5.1's
-// limits. Drop this once pi-ai lists claude-fable-5-2.
-const anthropicModels = getModels("anthropic");
-const fable51 = anthropicModels.find((m) => m.id === "claude-fable-5-1");
-const MODELS = buildModels(
-	fable51 && !anthropicModels.some((m) => m.id === "claude-fable-5-2")
-		? [...anthropicModels, { ...fable51, id: "claude-fable-5-2", name: "Claude Fable 5.2" }]
-		: anthropicModels,
-);
+const MODELS = buildModels(getModels("anthropic"));
 let providerSettings: NonNullable<Config["provider"]> = {};
 let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
 
